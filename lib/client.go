@@ -204,6 +204,7 @@ func (c *Client) CheckConnection(timeout time.Duration, cancelCtx context.Contex
 		return false
 	}
 
+	pinger.SetPrivileged(true)
 	pinger.Timeout = timeout
 	pinger.Count = 3
 	pinger.Interval = 10 * time.Millisecond // Send approximately all at once
