@@ -287,15 +287,14 @@ func (srv *Server) iptablesSnatRule(enabled bool) error {
 }
 
 func (srv *Server) StartIptables() error {
-	err := srv.iptablesInputFwmarkRule(true)
-	if err != nil {
-		return fmt.Errorf("failed to add fwmark rule: %v", err)
+	// Add masquerade rule for the outbound interface.
+	rule := []string{
+		"-o", srv.BindIface.Attrs().Name,
+		"-j", "MASQUERADE",
+		"-m", "comment", "--comment", fmt.Sprintf("vprox masquerade rule for %s", srv.Ifname()),
 	}
-
-	err = srv.iptablesSnatRule(true)
-	if err != nil {
-		srv.iptablesInputFwmarkRule(false)
-		return fmt.Errorf("failed to add SNAT rule: %v", err)
+	if err := srv.Ipt.AppendUnique("nat", "POSTROUTING", rule...); err != nil {
+		return fmt.Errorf("failed to add masquerade rule: %v", err)
 	}
 
 	return nil
