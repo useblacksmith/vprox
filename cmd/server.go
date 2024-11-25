@@ -24,10 +24,12 @@ var ServerCmd = &cobra.Command{
 }
 
 var serverCmdArgs struct {
-	ip           []string
-	wgBlock      string
-	wgBlockPerIp string
-	cloud        string
+	ip                  []string
+	wgBlock             string
+	wgBlockPerIp        string
+	cloud               string
+	region              string
+	internalNetworkCidr string
 }
 
 func init() {
@@ -39,6 +41,10 @@ func init() {
 		"", "WireGuard block size for each --ip flag, if multiple are provided")
 	ServerCmd.Flags().StringVar(&serverCmdArgs.cloud, "cloud",
 		"", "Cloud provider for IP metadata (watches for changes)")
+	ServerCmd.Flags().StringVar(&serverCmdArgs.region, "region", "",
+		"Region of the server")
+	ServerCmd.Flags().StringVar(&serverCmdArgs.internalNetworkCidr, "internal-network-cidr",
+		"10.0.0.0/24", "Internal network CIDR to route to")
 }
 
 func runServer(cmd *cobra.Command, args []string) error {
@@ -55,6 +61,9 @@ func runServer(cmd *cobra.Command, args []string) error {
 	}
 	if serverCmdArgs.wgBlock == "" {
 		return errors.New("missing required flag: --wg-block")
+	}
+	if serverCmdArgs.region == "" {
+		return errors.New("missing required flag: --region")
 	}
 
 	wgBlock, err := netip.ParsePrefix(serverCmdArgs.wgBlock)
@@ -97,7 +106,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	ctx, done := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 
-	sm, err := lib.NewServerManager(wgBlock, wgBlockPerIp, ctx, key, password)
+	sm, err := lib.NewServerManager(wgBlock, wgBlockPerIp, ctx, key, password, serverCmdArgs.region, serverCmdArgs.internalNetworkCidr)
 	if err != nil {
 		done()
 		return err
@@ -106,26 +115,17 @@ func runServer(cmd *cobra.Command, args []string) error {
 	defer sm.Wait()
 	defer done()
 
-	if cloud == "aws" {
-		initialIps, err := pollAws(lib.NewAwsMetadata(), make(ipSet), sm)
+	for _, ipStr := range serverCmdArgs.ip {
+		ip, err := netip.ParseAddr(ipStr)
+		if err != nil || !ip.Is4() {
+			return fmt.Errorf("invalid IPv4 address: %q", ipStr)
+		}
+		err = sm.Start(ip)
 		if err != nil {
 			return err
 		}
-
-		pollAwsLoop(ctx, sm, initialIps)
-	} else {
-		for _, ipStr := range serverCmdArgs.ip {
-			ip, err := netip.ParseAddr(ipStr)
-			if err != nil || !ip.Is4() {
-				return fmt.Errorf("invalid IPv4 address: %q", ipStr)
-			}
-			err = sm.Start(ip)
-			if err != nil {
-				return err
-			}
-		}
-		sm.Wait()
 	}
+	sm.Wait()
 
 	return nil
 }
@@ -144,57 +144,4 @@ func parseIpSet(ipStrs []string) (ipSet, error) {
 		m[ip] = struct{}{}
 	}
 	return m, nil
-}
-
-// pollAws gets the current set of IP associations from AWS and starts/stops the
-// server for those IPs.
-func pollAws(awsClient *lib.AwsMetadata, currentIps ipSet, sm *lib.ServerManager) (ipSet, error) {
-	interfaces, err := awsClient.GetAddresses()
-
-	if err != nil {
-		return currentIps, fmt.Errorf("failed to get AWS MAC addresses: %v", err)
-	}
-
-	newIps, err := parseIpSet(interfaces[0].PrivateIps)
-	if err != nil {
-		return currentIps, err
-	}
-
-	for ip := range currentIps {
-		if _, ok := newIps[ip]; !ok {
-			sm.Stop(ip)
-			delete(currentIps, ip)
-		}
-	}
-
-	for ip := range newIps {
-		if _, ok := currentIps[ip]; !ok {
-			if err := sm.Start(ip); err != nil {
-				return currentIps, fmt.Errorf("error starting new ip: %v", err)
-			}
-			currentIps[ip] = struct{}{}
-		}
-	}
-	return currentIps, nil
-}
-
-// pollAwsLoop polls AWS in a blocking loop on an interval of AWS_POLL_DURATION
-// until ctx is done.
-func pollAwsLoop(ctx context.Context, sm *lib.ServerManager, initialIps ipSet) {
-	currentIps := initialIps
-	awsClient := lib.NewAwsMetadata()
-	ticker := time.NewTicker(awsPollDuration)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			var err error
-			currentIps, err = pollAws(awsClient, currentIps, sm)
-			if err != nil {
-				fmt.Printf("error during aws poll: %v", err)
-			}
-		}
-	}
 }
