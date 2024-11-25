@@ -21,15 +21,17 @@ type ServerInfo struct {
 // ServerManager handles creating and terminating servers on ips
 // ServerManager is not thread safe for concurrent access.
 type ServerManager struct {
-	wgClient      *wgctrl.Client
-	ipt           *iptables.IPTables
-	key           wgtypes.Key
-	password      string
-	ctx           context.Context
-	waitGroup     *sync.WaitGroup
-	wgBlock       netip.Prefix
-	wgBlockPerIp  uint
-	activeServers map[netip.Addr]ServerInfo
+	wgClient            *wgctrl.Client
+	ipt                 *iptables.IPTables
+	key                 wgtypes.Key
+	password            string
+	ctx                 context.Context
+	waitGroup           *sync.WaitGroup
+	wgBlock             netip.Prefix
+	wgBlockPerIp        uint
+	activeServers       map[netip.Addr]ServerInfo
+	region              string
+	internalNetworkCidr string
 
 	// freeIndices and nextFreeIndex together track usage of the range 0..numWgBlocks
 	freeIndices   []uint16 // stack of indices that are free
@@ -37,7 +39,7 @@ type ServerManager struct {
 }
 
 // NewServerManager creates a new server manager
-func NewServerManager(wgBlock netip.Prefix, wgBlockPerIp uint, ctx context.Context, key wgtypes.Key, password string) (*ServerManager, error) {
+func NewServerManager(wgBlock netip.Prefix, wgBlockPerIp uint, ctx context.Context, key wgtypes.Key, password string, region string, internalNetworkCidr string) (*ServerManager, error) {
 	// Make a shared WireGuard client.
 	wgClient, err := wgctrl.New()
 	if err != nil {
@@ -64,6 +66,8 @@ func NewServerManager(wgBlock netip.Prefix, wgBlockPerIp uint, ctx context.Conte
 	sm.wgBlock = wgBlock.Masked()
 	sm.wgBlockPerIp = wgBlockPerIp
 	sm.activeServers = make(map[netip.Addr]ServerInfo)
+	sm.region = region
+	sm.internalNetworkCidr = internalNetworkCidr
 	return sm, nil
 }
 
@@ -104,14 +108,16 @@ func (sm *ServerManager) Start(ip netip.Addr) error {
 	wgCidr := netip.PrefixFrom(subnetStart.Next(), int(sm.wgBlockPerIp))
 
 	srv := &Server{
-		Key:      sm.key,
-		BindAddr: ip,
-		Password: sm.password,
-		Index:    i,
-		Ipt:      sm.ipt,
-		WgClient: sm.wgClient,
-		WgCidr:   wgCidr,
-		Ctx:      subctx,
+		Key:                 sm.key,
+		BindAddr:            ip,
+		Password:            sm.password,
+		Index:               i,
+		Ipt:                 sm.ipt,
+		WgClient:            sm.wgClient,
+		WgCidr:              wgCidr,
+		Ctx:                 subctx,
+		Region:              sm.region,
+		InternalNetworkCidr: sm.internalNetworkCidr,
 	}
 	if err := srv.InitState(); err != nil {
 		_ = cancel // cancel should be discarded
