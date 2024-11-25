@@ -297,15 +297,88 @@ func (srv *Server) StartIptables() error {
 		return fmt.Errorf("failed to add masquerade rule: %v", err)
 	}
 
+	// Add rule to allow forwarding from WireGuard interface
+	rule = []string{
+		"-i", srv.Ifname(),
+		"-j", "ACCEPT",
+		"-m", "comment", "--comment", fmt.Sprintf("vprox forward rule for %s", srv.Ifname()),
+	}
+	if err := srv.Ipt.AppendUnique("filter", "FORWARD", rule...); err != nil {
+		return fmt.Errorf("failed to add forward rule: %v", err)
+	}
+
+	// Add TCP MSS clamping rules for both directions
+	tcpMssRule := []string{
+		"-o", srv.Ifname(),
+		"-p", "tcp",
+		"--tcp-flags", "SYN,RST", "SYN",
+		"-j", "TCPMSS",
+		"--clamp-mss-to-pmtu",
+		"-m", "comment", "--comment", fmt.Sprintf("vprox TCP MSS outbound rule for %s", srv.Ifname()),
+	}
+	if err := srv.Ipt.AppendUnique("mangle", "FORWARD", tcpMssRule...); err != nil {
+		return fmt.Errorf("failed to add outbound TCP MSS rule: %v", err)
+	}
+
+	tcpMssRule = []string{
+		"-i", srv.Ifname(),
+		"-p", "tcp",
+		"--tcp-flags", "SYN,RST", "SYN",
+		"-j", "TCPMSS",
+		"--clamp-mss-to-pmtu",
+		"-m", "comment", "--comment", fmt.Sprintf("vprox TCP MSS inbound rule for %s", srv.Ifname()),
+	}
+	if err := srv.Ipt.AppendUnique("mangle", "FORWARD", tcpMssRule...); err != nil {
+		return fmt.Errorf("failed to add inbound TCP MSS rule: %v", err)
+	}
+
 	return nil
 }
 
 func (srv *Server) CleanupIptables() {
-	if err := srv.iptablesInputFwmarkRule(false); err != nil {
-		log.Printf("warning: error cleaning up IP tables: failed to add fwmark rule: %v\n", err)
+	// Remove masquerade rule
+	rule := []string{
+		"-o", srv.BindIface.Attrs().Name,
+		"-j", "MASQUERADE",
+		"-m", "comment", "--comment", fmt.Sprintf("vprox masquerade rule for %s", srv.Ifname()),
 	}
-	if err := srv.iptablesSnatRule(false); err != nil {
-		log.Printf("warning: error cleaning up IP tables: failed to add SNAT rule: %v\n", err)
+	if err := srv.Ipt.Delete("nat", "POSTROUTING", rule...); err != nil {
+		log.Printf("failed to remove masquerade rule: %v", err)
+	}
+
+	// Remove forwarding rule
+	rule = []string{
+		"-i", srv.Ifname(),
+		"-j", "ACCEPT",
+		"-m", "comment", "--comment", fmt.Sprintf("vprox forward rule for %s", srv.Ifname()),
+	}
+	if err := srv.Ipt.Delete("filter", "FORWARD", rule...); err != nil {
+		log.Printf("failed to remove forward rule: %v", err)
+	}
+
+	// Remove TCP MSS clamping rules
+	tcpMssRule := []string{
+		"-o", srv.Ifname(),
+		"-p", "tcp",
+		"--tcp-flags", "SYN,RST", "SYN",
+		"-j", "TCPMSS",
+		"--clamp-mss-to-pmtu",
+		"-m", "comment", "--comment", fmt.Sprintf("vprox TCP MSS outbound rule for %s", srv.Ifname()),
+	}
+	if err := srv.Ipt.Delete("mangle", "FORWARD", tcpMssRule...); err != nil {
+		log.Printf("failed to remove outbound TCP MSS rule: %v", err)
+	}
+
+	tcpMssRule = []string{
+		"-i", srv.Ifname(),
+		"-p", "tcp",
+		"--tcp-flags", "SYN,RST", "SYN",
+		"-j", "TCPMSS",
+		"--clamp-mss-to-pmtu",
+		"-m", "comment", "--comment", fmt.Sprintf("vprox TCP MSS inbound rule for %s", srv.Ifname()),
+	}
+	if err := srv.Ipt.Delete("mangle", "FORWARD", tcpMssRule...); err != nil {
+		log.Printf("failed to remove inbound TCP MSS rule: %v", err)
 	}
 }
 
