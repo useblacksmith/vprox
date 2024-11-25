@@ -332,6 +332,45 @@ func (srv *Server) StartIptables() error {
 		return fmt.Errorf("failed to add inbound TCP MSS rule: %v", err)
 	}
 
+	// SNAT rule for internal network traffic
+	// TODO(adityamaru): Make the source and the -o interface dynamic and not hardcoded.
+	rule = []string{
+		"-s", "10.100.0.0/16",
+		"-d", "10.0.0.0/24",
+		"-o", "bond0.2",
+		"-j", "SNAT", "--to-source", "10.0.0.40",
+		"-m", "comment", "--comment", "SNAT for WireGuard to internal network",
+	}
+	if err := srv.Ipt.AppendUnique("nat", "POSTROUTING", rule...); err != nil {
+		return fmt.Errorf("failed to add SNAT rule: %v", err)
+	}
+
+	// FORWARD rule from WireGuard to internal network
+	rule = []string{
+		"-i", srv.Ifname(),
+		"-o", "bond0.2",
+		"-s", "10.100.0.0/16",
+		"-d", "10.0.0.0/24",
+		"-j", "ACCEPT",
+		"-m", "comment", "--comment", "Forward from WireGuard to internal network",
+	}
+	if err := srv.Ipt.AppendUnique("filter", "FORWARD", rule...); err != nil {
+		return fmt.Errorf("failed to add FORWARD rule: %v", err)
+	}
+
+	// FORWARD rule from internal network to WireGuard
+	rule = []string{
+		"-i", "bond0.2",
+		"-o", srv.Ifname(),
+		"-s", "10.0.0.0/24",
+		"-d", "10.100.0.0/16",
+		"-j", "ACCEPT",
+		"-m", "comment", "--comment", "Forward from internal network to WireGuard",
+	}
+	if err := srv.Ipt.AppendUnique("filter", "FORWARD", rule...); err != nil {
+		return fmt.Errorf("failed to add FORWARD rule: %v", err)
+	}
+
 	return nil
 }
 
@@ -379,6 +418,45 @@ func (srv *Server) CleanupIptables() {
 	}
 	if err := srv.Ipt.Delete("mangle", "FORWARD", tcpMssRule...); err != nil {
 		log.Printf("failed to remove inbound TCP MSS rule: %v", err)
+	}
+
+	// Remove SNAT rule for internal traffic
+	rule = []string{
+		"-s", srv.WgCidr.String(),
+		"-d", "10.0.0.0/24",
+		"-o", srv.BindIface.Attrs().Name,
+		"-j", "SNAT",
+		"--to-source", srv.BindAddr.String(),
+		"-m", "comment", "--comment", fmt.Sprintf("vprox SNAT rule for internal traffic from %s", srv.Ifname()),
+	}
+	if err := srv.Ipt.Delete("nat", "POSTROUTING", rule...); err != nil {
+		log.Printf("failed to remove SNAT rule for internal traffic: %v", err)
+	}
+
+	// Remove forward rule from WireGuard to internal network
+	rule = []string{
+		"-i", srv.Ifname(),
+		"-o", srv.BindIface.Attrs().Name,
+		"-s", srv.WgCidr.String(),
+		"-d", "10.0.0.0/24",
+		"-j", "ACCEPT",
+		"-m", "comment", "--comment", fmt.Sprintf("vprox forward rule from %s to internal network", srv.Ifname()),
+	}
+	if err := srv.Ipt.Delete("filter", "FORWARD", rule...); err != nil {
+		log.Printf("failed to remove forward rule from WireGuard to internal network: %v", err)
+	}
+
+	// Remove forward rule from internal network to WireGuard
+	rule = []string{
+		"-i", srv.BindIface.Attrs().Name,
+		"-o", srv.Ifname(),
+		"-s", "10.0.0.0/24",
+		"-d", srv.WgCidr.String(),
+		"-j", "ACCEPT",
+		"-m", "comment", "--comment", fmt.Sprintf("vprox forward rule from internal network to %s", srv.Ifname()),
+	}
+	if err := srv.Ipt.Delete("filter", "FORWARD", rule...); err != nil {
+		log.Printf("failed to remove forward rule from internal network to WireGuard: %v", err)
 	}
 }
 
