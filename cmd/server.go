@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/netip"
+	"os"
 	"os/signal"
 	"strconv"
 	"syscall"
@@ -114,6 +116,16 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	defer sm.Wait()
 	defer done()
+
+	// Start the liveness reporter.
+	livenessReporter := &LivenessReporter{
+		client:            http.Client{Timeout: 5 * time.Second},
+		ip:                serverCmdArgs.ip[0],
+		region:            serverCmdArgs.region,
+		backendEndpoint:   os.Getenv("BACKEND_ENDPOINT"),
+		backendAdminToken: os.Getenv("BACKEND_ADMIN_TOKEN"),
+	}
+	livenessReporter.Start(ctx)
 
 	for _, ipStr := range serverCmdArgs.ip {
 		ip, err := netip.ParseAddr(ipStr)
