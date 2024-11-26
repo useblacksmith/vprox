@@ -32,7 +32,7 @@ func (r *LivenessReporter) Report(ctx context.Context) {
 		return
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/staticip/liveness", r.backendEndpoint), bytes.NewBuffer(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/api/admin/staticip/liveness", r.backendEndpoint), bytes.NewBuffer(jsonBody))
 	if err != nil {
 		fmt.Printf("failed to create request: %v\n", err)
 		return
