@@ -1,18 +1,15 @@
 package lib
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/netip"
-	"net/url"
 	"time"
 
+	"github.com/go-resty/resty/v2"
 	probing "github.com/prometheus-community/pro-bing"
 	"github.com/vishvananda/netlink"
 	"golang.zx2c4.com/wireguard/wgctrl"
@@ -37,7 +34,7 @@ type Client struct {
 	WgClient *wgctrl.Client
 
 	// Http is used to make connect requests to the server.
-	Http *http.Client
+	Http *resty.Client
 
 	// wgCidr is the current subnet assigned to the WireGuard interface, if any.
 	wgCidr netip.Prefix
@@ -112,47 +109,32 @@ func (c *Client) updateInterface(resp connectResponse) error {
 	return nil
 }
 
+const connectionTimeout = 5 * time.Second
+
 // sendConnectionRequest attempts to send a connection request to the peer
 func (c *Client) sendConnectionRequest() (connectResponse, error) {
-	connectUrl, err := url.Parse(fmt.Sprintf("https://%s/connect", c.ServerIp))
-	if err != nil {
-		return connectResponse{}, fmt.Errorf("failed to parse connect URL: %v", err)
-	}
+	connectUrl := fmt.Sprintf("https://%s/connect", c.ServerIp)
 
 	reqJson := &connectRequest{
 		PeerPublicKey: c.Key.PublicKey().String(),
 	}
-	buf, err := json.Marshal(reqJson)
-	if err != nil {
-		return connectResponse{}, fmt.Errorf("failed to marshal connect request: %v", err)
-	}
 
-	req := &http.Request{
-		Method: http.MethodPost,
-		URL:    connectUrl,
-		Header: http.Header{
-			"Authorization": []string{"Bearer " + c.Password},
-		},
-		Body: io.NopCloser(bytes.NewBuffer(buf)),
-	}
+	var respJson connectResponse
+	resp, err := c.Http.SetTimeout(connectionTimeout).
+		R().
+		SetHeader("Authorization", "Bearer "+c.Password).
+		SetBody(reqJson).
+		SetResult(&respJson).
+		Post(connectUrl)
 
-	resp, err := c.Http.Do(req)
 	if err != nil {
 		return connectResponse{}, fmt.Errorf("failed to connect to server: %v", err)
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return connectResponse{}, fmt.Errorf("server returned status %v", resp.Status)
+	if resp.StatusCode() != http.StatusOK {
+		return connectResponse{}, fmt.Errorf("server returned status %v", resp.Status())
 	}
 
-	buf, err = io.ReadAll(resp.Body)
-	if err != nil {
-		return connectResponse{}, fmt.Errorf("failed to read response body: %v", err)
-	}
-
-	var respJson connectResponse
-	json.Unmarshal(buf, &respJson)
 	return respJson, nil
 }
 

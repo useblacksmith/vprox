@@ -6,6 +6,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.16.12
 	github.com/coreos/go-iptables v0.8.0
 	github.com/fatih/color v1.17.0
+	github.com/go-resty/resty/v2 v2.16.2
 	github.com/prometheus-community/pro-bing v0.4.1
 	github.com/spf13/cobra v1.8.1
 	github.com/stretchr/testify v1.9.0

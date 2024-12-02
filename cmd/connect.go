@@ -41,6 +41,21 @@ func init() {
 		"vprox0", "Interface name to proxy traffic through the VPN")
 }
 
+// runConnect establishes and maintains a VPN connection to a server at the specified IP address.
+// It handles the initial connection setup, performs health checks, and automatically attempts
+// to reconnect if the connection is lost. The connection will be maintained until interrupted
+// by a SIGINT or SIGTERM signal.
+//
+// The function expects:
+// - A valid IPv4 address as the first and only argument
+// - The interface name to be specified via the --interface flag (defaults to "vprox0")
+//
+// It will return an error if:
+// - The IP address is invalid or not IPv4
+// - Client key or password retrieval fails
+// - Interface creation fails
+// - Initial connection fails
+// - Initial health check fails
 func runConnect(cmd *cobra.Command, args []string) error {
 	serverIp, err := netip.ParseAddr(args[0])
 	if err != nil || !serverIp.Is4() {
