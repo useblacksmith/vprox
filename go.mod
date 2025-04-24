@@ -1,6 +1,7 @@
 module github.com/modal-labs/vprox
 
 go 1.22.5
+toolchain go1.24.1
 
 require (
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.16.12
@@ -29,10 +30,10 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
 	github.com/vishvananda/netns v0.0.4 // indirect
-	golang.org/x/crypto v0.27.0 // indirect
-	golang.org/x/net v0.29.0 // indirect
+	golang.org/x/crypto v0.36.0 // indirect
+	golang.org/x/net v0.38.0 // indirect
 	golang.org/x/sync v0.8.0 // indirect
-	golang.org/x/sys v0.25.0 // indirect
+	golang.org/x/sys v0.31.0 // indirect
 	golang.zx2c4.com/wireguard v0.0.0-20231211153847-12269c276173 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
