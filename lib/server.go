@@ -161,7 +161,7 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 
 	peerKey, err := wgtypes.ParseKey(req.PeerPublicKey)
 	if err != nil {
-		http.Error(w, "invalid peer public key", http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("invalid peer public key: %v", err), http.StatusBadRequest)
 		return
 	}
 
