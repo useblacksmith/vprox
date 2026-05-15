@@ -87,21 +87,33 @@ func (srv *Server) connectIpipHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Idempotent path: if we already have an IPIP tunnel for this client IP,
-	// refresh its lastSeen and return the same assignment.
-	//
-	// If the interface was destroyed out-of-band the stored assignment is
-	// briefly stale, but removeIdleIpipPeers notices the missing interface
-	// within one poll interval and drops the peer, so a retry rebuilds it.
+	// Idempotent path: if we already have an IPIP tunnel for this client
+	// IP AND its kernel interface still exists, refresh its lastSeen and
+	// return the same assignment. If the interface vanished out-of-band
+	// (manual `ip link del`, kernel reload, etc.) we cannot just refresh
+	// lastSeen: a retrying client would keep the stale entry alive
+	// forever, since removeIdleIpipPeers's freshness guard skips a peer
+	// whose lastSeen was just bumped. Drop the stale entry here and fall
+	// through to fresh allocation.
 	srv.ipipMu.Lock()
 	if existing, ok := srv.ipipPeers[clientIP]; ok {
-		existing.lastSeen = time.Now()
-		assigned := fmt.Sprintf("%v/%d", existing.peerIP, srv.WgCidr.Bits())
+		if _, err := netlink.LinkByName(existing.ifname); err == nil {
+			existing.lastSeen = time.Now()
+			assigned := fmt.Sprintf("%v/%d", existing.peerIP, srv.WgCidr.Bits())
+			srv.ipipMu.Unlock()
+			writeIpipResponse(w, assigned)
+			return
+		}
+		// Interface is gone; reclaim and rebuild.
+		log.Printf("[%v] ipip iface %s for %v vanished; rebuilding",
+			srv.BindAddr, existing.ifname, clientIP)
+		delete(srv.ipipPeers, clientIP)
 		srv.ipipMu.Unlock()
-		writeIpipResponse(w, assigned)
-		return
+		srv.removeIpipPeerFilter(existing.ifname, existing.peerIP)
+		srv.ipAllocator.Free(existing.peerIP)
+	} else {
+		srv.ipipMu.Unlock()
 	}
-	srv.ipipMu.Unlock()
 
 	peerIP := srv.ipAllocator.Allocate()
 	if peerIP.IsUnspecified() {
@@ -351,12 +363,19 @@ func (srv *Server) removeIdleIpipPeers() error {
 	srv.ipipMu.Unlock()
 
 	now := time.Now()
-	var toRemove []snapshot
+	type removal struct {
+		snapshot
+		vanished bool
+	}
+	var toRemove []removal
 	for _, s := range snaps {
 		link, err := netlink.LinkByName(s.ifname)
 		if err != nil {
-			// The interface vanished out from under us. Treat as removable.
-			toRemove = append(toRemove, s)
+			// The interface vanished out from under us (manual `ip link
+			// del`, kernel reload, etc.). Reap unconditionally; the
+			// freshness guard in the removal loop does not apply because
+			// the entry is unusable regardless of lastSeen.
+			toRemove = append(toRemove, removal{snapshot: s, vanished: true})
 			continue
 		}
 		stats := link.Attrs().Statistics
@@ -376,30 +395,38 @@ func (srv *Server) removeIdleIpipPeers() error {
 		srv.ipipMu.Unlock()
 
 		if idle {
-			toRemove = append(toRemove, s)
+			toRemove = append(toRemove, removal{snapshot: s})
 		}
 	}
 
-	for _, s := range toRemove {
+	for _, r := range toRemove {
 		srv.ipipMu.Lock()
 		// Re-check inside the lock in case a fresh /connect-ipip from the
-		// same client IP just bumped lastSeen.
-		current, ok := srv.ipipPeers[s.clientIP]
-		if !ok || current != s.peer {
+		// same client IP just replaced this entry.
+		current, ok := srv.ipipPeers[r.clientIP]
+		if !ok || current != r.peer {
 			srv.ipipMu.Unlock()
 			continue
 		}
-		if now.Sub(current.lastSeen) <= PeerIdleTimeout {
+		// For idle-timeout removals, give a racing /connect-ipip that
+		// bumped lastSeen the benefit of the doubt. For vanished
+		// interfaces there's nothing to keep alive: the kernel state
+		// is gone, so reap regardless of lastSeen.
+		if !r.vanished && now.Sub(current.lastSeen) <= PeerIdleTimeout {
 			srv.ipipMu.Unlock()
 			continue
 		}
-		delete(srv.ipipPeers, s.clientIP)
+		delete(srv.ipipPeers, r.clientIP)
 		srv.ipipMu.Unlock()
 
-		log.Printf("[%v] removing idle ipip peer %v at %v",
-			srv.BindAddr, s.clientIP, s.peer.peerIP)
-		srv.tearDownIpipLink(s.peer.ifname, s.peer.peerIP)
-		srv.ipAllocator.Free(s.peer.peerIP)
+		reason := "idle"
+		if r.vanished {
+			reason = "vanished"
+		}
+		log.Printf("[%v] removing %s ipip peer %v at %v",
+			srv.BindAddr, reason, r.clientIP, r.peer.peerIP)
+		srv.tearDownIpipLink(r.peer.ifname, r.peer.peerIP)
+		srv.ipAllocator.Free(r.peer.peerIP)
 	}
 	return nil
 }
