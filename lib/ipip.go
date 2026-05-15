@@ -428,17 +428,24 @@ func (srv *Server) iptablesIpipMssRules(enabled bool) error {
 		"-m", "comment", "--comment",
 		fmt.Sprintf("vprox ipip TCP MSS inbound rule for %s", srv.Ifname()),
 	}
-	apply := srv.Ipt.AppendUnique
-	op := "append"
-	if !enabled {
-		apply = srv.Ipt.Delete
-		op = "delete"
+	if enabled {
+		if err := srv.Ipt.AppendUnique("mangle", "FORWARD", out...); err != nil {
+			return fmt.Errorf("append ipip outbound MSS rule: %v", err)
+		}
+		if err := srv.Ipt.AppendUnique("mangle", "FORWARD", in...); err != nil {
+			return fmt.Errorf("append ipip inbound MSS rule: %v", err)
+		}
+		return nil
 	}
-	if err := apply("mangle", "FORWARD", out...); err != nil {
-		return fmt.Errorf("%s ipip outbound MSS rule: %v", op, err)
+
+	// Cleanup path: attempt both deletions independently so a failure on
+	// the first doesn't leak the second (matches the WG MSS cleanup
+	// pattern in CleanupIptables).
+	if err := srv.Ipt.Delete("mangle", "FORWARD", out...); err != nil {
+		log.Printf("failed to remove ipip outbound MSS rule: %v", err)
 	}
-	if err := apply("mangle", "FORWARD", in...); err != nil {
-		return fmt.Errorf("%s ipip inbound MSS rule: %v", op, err)
+	if err := srv.Ipt.Delete("mangle", "FORWARD", in...); err != nil {
+		log.Printf("failed to remove ipip inbound MSS rule: %v", err)
 	}
 	return nil
 }
