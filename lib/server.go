@@ -626,12 +626,11 @@ func (srv *Server) StartIptables() error {
 		return fmt.Errorf("failed to add inbound TCP MSS rule: %v", err)
 	}
 
-	// Rules covering this server's IPIP peer interfaces. The interfaces are
-	// created lazily by /connect-ipip, but the FORWARD/MSS rules can be
-	// installed upfront via a wildcard so they are ready when peers attach.
-	if err := srv.iptablesIpipForwardRule(true); err != nil {
-		return fmt.Errorf("failed to add ipip forward rule: %v", err)
-	}
+	// Wildcard TCP MSS clamping for this server's IPIP interfaces. The
+	// interfaces themselves are created lazily by /connect-ipip; the
+	// FORWARD ACCEPT/DROP filter is installed per peer at that point so
+	// each tunnel only accepts traffic with the inner source IP we
+	// assigned to it (see addIpipPeerFilter).
 	if err := srv.iptablesIpipMssRules(true); err != nil {
 		return fmt.Errorf("failed to add ipip MSS rules: %v", err)
 	}
@@ -735,9 +734,6 @@ func (srv *Server) CleanupIptables() {
 		log.Printf("failed to remove inbound TCP MSS rule: %v", err)
 	}
 
-	if err := srv.iptablesIpipForwardRule(false); err != nil {
-		log.Printf("failed to remove ipip forward rule: %v", err)
-	}
 	if err := srv.iptablesIpipMssRules(false); err != nil {
 		log.Printf("failed to remove ipip MSS rules: %v", err)
 	}

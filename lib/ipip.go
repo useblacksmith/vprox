@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"time"
 
 	"github.com/vishvananda/netlink"
@@ -126,7 +127,7 @@ func (srv *Server) connectIpipHandler(w http.ResponseWriter, r *http.Request) {
 	srv.ipipMu.Lock()
 	if winner, ok := srv.ipipPeers[clientIP]; ok {
 		srv.ipipMu.Unlock()
-		srv.tearDownIpipLink(ifname)
+		srv.tearDownIpipLink(ifname, peerIP)
 		srv.ipAllocator.Free(peerIP)
 		writeIpipResponse(w, fmt.Sprintf("%v/%d", winner.peerIP, srv.WgCidr.Bits()))
 		return
@@ -202,13 +203,41 @@ func (srv *Server) createIpipLink(ifname string, remote, peerIP netip.Addr) erro
 		return fmt.Errorf("add host route for %v: %v", peerIP, err)
 	}
 
+	// Strict reverse-path filtering: the kernel drops decapsulated packets
+	// whose inner source IP wouldn't route back through the same interface
+	// they arrived on. Combined with the per-peer /32 route installed
+	// above, this means an attacker who can send IPIP packets to us as
+	// some registered client's outer IP still can't inject inner traffic
+	// claiming to be from a different peer's inner IP.
+	//
+	// Linux uses max(conf.all.rp_filter, conf.<iface>.rp_filter), so
+	// setting it to 1 here is enough regardless of the global default.
+	// Best-effort: log and continue if the sysctl is missing.
+	if err := setRpFilter(ifname, 1); err != nil {
+		log.Printf("[%v] failed to enable rp_filter on %s: %v",
+			srv.BindAddr, ifname, err)
+	}
+
+	// Per-peer iptables filter: only accept forwarded traffic whose inner
+	// source IP matches the peer we assigned this tunnel to, and drop
+	// everything else arriving on this interface. This is defence in depth
+	// alongside rp_filter; it's enforced independently of the routing
+	// table and is more obvious at audit time.
+	if err := srv.addIpipPeerFilter(ifname, peerIP); err != nil {
+		_ = netlink.LinkDel(resolved)
+		return fmt.Errorf("install ipip peer filter: %v", err)
+	}
+
 	return nil
 }
 
-// tearDownIpipLink removes the IPIP interface and any associated host route.
-// The interface deletion is what carries the kernel state; the explicit
-// RouteDel is belt-and-braces in case the route somehow outlives the link.
-func (srv *Server) tearDownIpipLink(ifname string) {
+// tearDownIpipLink removes the per-peer iptables filter and the IPIP
+// interface. The interface deletion is what carries the kernel state;
+// removing the iptables rules first keeps them from referencing a vanished
+// interface for the brief window before they're cleaned up.
+func (srv *Server) tearDownIpipLink(ifname string, peerIP netip.Addr) {
+	srv.removeIpipPeerFilter(ifname, peerIP)
+
 	link, err := netlink.LinkByName(ifname)
 	if err != nil {
 		// Already gone; nothing to do.
@@ -216,6 +245,65 @@ func (srv *Server) tearDownIpipLink(ifname string) {
 	}
 	if err := netlink.LinkDel(link); err != nil {
 		log.Printf("[%v] failed to delete ipip link %s: %v",
+			srv.BindAddr, ifname, err)
+	}
+}
+
+// setRpFilter writes the per-interface rp_filter sysctl. The /proc entry
+// exists as soon as the interface is created.
+func setRpFilter(ifname string, val int) error {
+	path := fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/rp_filter", ifname)
+	return os.WriteFile(path, []byte(fmt.Sprintf("%d\n", val)), 0644)
+}
+
+// ipipPeerAcceptRule is the iptables rule that permits forwarded traffic
+// arriving on this peer's IPIP interface with the expected inner source IP.
+func ipipPeerAcceptRule(ifname string, peerIP netip.Addr) []string {
+	return []string{
+		"-i", ifname,
+		"-s", fmt.Sprintf("%v/32", peerIP),
+		"-j", "ACCEPT",
+		"-m", "comment", "--comment",
+		fmt.Sprintf("vprox ipip accept peer %v on %s", peerIP, ifname),
+	}
+}
+
+// ipipPeerDropRule is the iptables rule that drops anything else arriving
+// on this peer's IPIP interface (i.e. inner source spoofing).
+func ipipPeerDropRule(ifname string) []string {
+	return []string{
+		"-i", ifname,
+		"-j", "DROP",
+		"-m", "comment", "--comment",
+		fmt.Sprintf("vprox ipip drop spoofed on %s", ifname),
+	}
+}
+
+func (srv *Server) addIpipPeerFilter(ifname string, peerIP netip.Addr) error {
+	accept := ipipPeerAcceptRule(ifname, peerIP)
+	if err := srv.Ipt.AppendUnique("filter", "FORWARD", accept...); err != nil {
+		return fmt.Errorf("add ipip accept rule: %v", err)
+	}
+	drop := ipipPeerDropRule(ifname)
+	if err := srv.Ipt.AppendUnique("filter", "FORWARD", drop...); err != nil {
+		_ = srv.Ipt.Delete("filter", "FORWARD", accept...)
+		return fmt.Errorf("add ipip drop rule: %v", err)
+	}
+	return nil
+}
+
+func (srv *Server) removeIpipPeerFilter(ifname string, peerIP netip.Addr) {
+	// The interface is about to be deleted (or already is), so removal
+	// order doesn't matter for security; either rule alone matches
+	// nothing once the interface is gone. Use DeleteIfExists so a
+	// partially-installed filter (e.g. failed mid-add) cleans up
+	// without a noisy "rule does not exist" error.
+	if err := srv.Ipt.DeleteIfExists("filter", "FORWARD", ipipPeerDropRule(ifname)...); err != nil {
+		log.Printf("[%v] failed to remove ipip drop rule for %s: %v",
+			srv.BindAddr, ifname, err)
+	}
+	if err := srv.Ipt.DeleteIfExists("filter", "FORWARD", ipipPeerAcceptRule(ifname, peerIP)...); err != nil {
+		log.Printf("[%v] failed to remove ipip accept rule for %s: %v",
 			srv.BindAddr, ifname, err)
 	}
 }
@@ -296,7 +384,7 @@ func (srv *Server) removeIdleIpipPeers() error {
 
 		log.Printf("[%v] removing idle ipip peer %v at %v",
 			srv.BindAddr, s.clientIP, s.peer.peerIP)
-		srv.tearDownIpipLink(s.peer.ifname)
+		srv.tearDownIpipLink(s.peer.ifname, s.peer.peerIP)
 		srv.ipAllocator.Free(s.peer.peerIP)
 	}
 	return nil
@@ -314,24 +402,9 @@ func (srv *Server) CleanupIpip() {
 	srv.ipipMu.Unlock()
 
 	for _, p := range peers {
-		srv.tearDownIpipLink(p.ifname)
+		srv.tearDownIpipLink(p.ifname, p.peerIP)
 		srv.ipAllocator.Free(p.peerIP)
 	}
-}
-
-// iptablesIpipForwardRule adds or removes the FORWARD ACCEPT rule that lets
-// decapsulated traffic from any of this server's IPIP interfaces transit.
-func (srv *Server) iptablesIpipForwardRule(enabled bool) error {
-	rule := []string{
-		"-i", srv.ipipIfaceWildcard(),
-		"-j", "ACCEPT",
-		"-m", "comment", "--comment",
-		fmt.Sprintf("vprox ipip forward rule for %s", srv.Ifname()),
-	}
-	if enabled {
-		return srv.Ipt.AppendUnique("filter", "FORWARD", rule...)
-	}
-	return srv.Ipt.Delete("filter", "FORWARD", rule...)
 }
 
 // iptablesIpipMssRules adds or removes TCP MSS clamping for the IPIP
