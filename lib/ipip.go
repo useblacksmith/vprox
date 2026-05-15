@@ -25,6 +25,7 @@ type ipipPeer struct {
 
 	lastSeen time.Time // last time we observed activity from this peer
 	rxBytes  uint64    // rx bytes observed at lastSeen, for activity detection
+	txBytes  uint64    // tx bytes observed at lastSeen, for activity detection
 }
 
 type connectIpipResponse struct {
@@ -88,6 +89,10 @@ func (srv *Server) connectIpipHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Idempotent path: if we already have an IPIP tunnel for this client IP,
 	// refresh its lastSeen and return the same assignment.
+	//
+	// If the interface was destroyed out-of-band the stored assignment is
+	// briefly stale, but removeIdleIpipPeers notices the missing interface
+	// within one poll interval and drops the peer, so a retry rebuilds it.
 	srv.ipipMu.Lock()
 	if existing, ok := srv.ipipPeers[clientIP]; ok {
 		existing.lastSeen = time.Now()
@@ -126,6 +131,7 @@ func (srv *Server) connectIpipHandler(w http.ResponseWriter, r *http.Request) {
 	// allocation or an interface.
 	srv.ipipMu.Lock()
 	if winner, ok := srv.ipipPeers[clientIP]; ok {
+		winner.lastSeen = time.Now()
 		srv.ipipMu.Unlock()
 		srv.tearDownIpipLink(ifname, peerIP)
 		srv.ipAllocator.Free(peerIP)
@@ -203,16 +209,20 @@ func (srv *Server) createIpipLink(ifname string, remote, peerIP netip.Addr) erro
 		return fmt.Errorf("add host route for %v: %v", peerIP, err)
 	}
 
-	// Strict reverse-path filtering: the kernel drops decapsulated packets
-	// whose inner source IP wouldn't route back through the same interface
-	// they arrived on. Combined with the per-peer /32 route installed
-	// above, this means an attacker who can send IPIP packets to us as
-	// some registered client's outer IP still can't inject inner traffic
-	// claiming to be from a different peer's inner IP.
+	// Reverse-path filtering: the kernel drops decapsulated packets whose
+	// inner source IP wouldn't route back through the same interface they
+	// arrived on. Combined with the per-peer /32 route installed above,
+	// this means an attacker who can send IPIP packets to us as some
+	// registered client's outer IP can't inject inner traffic claiming to
+	// be from a different peer's inner IP.
 	//
-	// Linux uses max(conf.all.rp_filter, conf.<iface>.rp_filter), so
-	// setting it to 1 here is enough regardless of the global default.
-	// Best-effort: log and continue if the sysctl is missing.
+	// Linux uses max(conf.all.rp_filter, conf.<iface>.rp_filter): setting
+	// the per-interface value to 1 forces strict filtering unless
+	// conf.all.rp_filter is 2 (loose), in which case this layer degrades
+	// to loose mode and no longer enforces the same-interface check. The
+	// per-peer iptables filter installed below is the authoritative
+	// anti-spoof control regardless; rp_filter is a best-effort backstop.
+	// Log and continue if the sysctl is missing.
 	if err := setRpFilter(ifname, 1); err != nil {
 		log.Printf("[%v] failed to enable rp_filter on %s: %v",
 			srv.BindAddr, ifname, err)
@@ -322,9 +332,11 @@ func (srv *Server) removeIdleIpipPeersLoop() {
 	}
 }
 
-// removeIdleIpipPeers prunes IPIP peers whose tunnel has seen no inbound
-// traffic for longer than PeerIdleTimeout. Activity is detected by polling
-// the interface's rx_bytes counter via netlink.
+// removeIdleIpipPeers prunes IPIP peers whose tunnel has seen no traffic for
+// longer than PeerIdleTimeout. Activity is detected by polling the
+// interface's rx_bytes and tx_bytes counters via netlink; counting both
+// directions means a peer in the middle of a one-way transfer (e.g. a
+// download with little return traffic) is not pruned mid-stream.
 func (srv *Server) removeIdleIpipPeers() error {
 	srv.ipipMu.Lock()
 	type snapshot struct {
@@ -348,14 +360,16 @@ func (srv *Server) removeIdleIpipPeers() error {
 			continue
 		}
 		stats := link.Attrs().Statistics
-		var rx uint64
+		var rx, tx uint64
 		if stats != nil {
 			rx = stats.RxBytes
+			tx = stats.TxBytes
 		}
 
 		srv.ipipMu.Lock()
-		if rx != s.peer.rxBytes {
+		if rx != s.peer.rxBytes || tx != s.peer.txBytes {
 			s.peer.rxBytes = rx
+			s.peer.txBytes = tx
 			s.peer.lastSeen = now
 		}
 		idle := now.Sub(s.peer.lastSeen) > PeerIdleTimeout
