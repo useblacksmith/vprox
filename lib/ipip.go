@@ -174,8 +174,17 @@ func (srv *Server) createIpipLink(ifname string, remote, peerIP netip.Addr) erro
 		return fmt.Errorf("add ipip link: %v", err)
 	}
 
-	if err := netlink.LinkSetUp(link); err != nil {
+	// netlink.LinkAdd does not populate the struct's Index field, so look up
+	// the link by name to get the kernel-assigned attributes (including the
+	// real ifindex) before we install routes that depend on it.
+	resolved, err := netlink.LinkByName(ifname)
+	if err != nil {
 		_ = netlink.LinkDel(link)
+		return fmt.Errorf("resolve ipip link %s: %v", ifname, err)
+	}
+
+	if err := netlink.LinkSetUp(resolved); err != nil {
+		_ = netlink.LinkDel(resolved)
 		return fmt.Errorf("bring up ipip link: %v", err)
 	}
 
@@ -184,12 +193,12 @@ func (srv *Server) createIpipLink(ifname string, remote, peerIP netip.Addr) erro
 	// route on the WireGuard interface).
 	dst := prefixToIPNet(netip.PrefixFrom(peerIP, 32))
 	route := &netlink.Route{
-		LinkIndex: link.Attrs().Index,
+		LinkIndex: resolved.Attrs().Index,
 		Dst:       &dst,
 		Scope:     netlink.SCOPE_LINK,
 	}
 	if err := netlink.RouteReplace(route); err != nil {
-		_ = netlink.LinkDel(link)
+		_ = netlink.LinkDel(resolved)
 		return fmt.Errorf("add host route for %v: %v", peerIP, err)
 	}
 
