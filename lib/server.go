@@ -107,6 +107,11 @@ type Server struct {
 	// kernel device: an entry is added when a peer is allocated an IP and
 	// removed when the reaper deletes an idle peer.
 	peerIPs map[wgtypes.Key]netip.Addr
+
+	// ipipMu protects ipipPeers. It is separate from mu so that the IPIP
+	// peer bookkeeping does not contend with the WireGuard peer state.
+	ipipMu    sync.Mutex
+	ipipPeers map[netip.Addr]*ipipPeer
 }
 
 // InitState initializes the private server state.
@@ -134,6 +139,7 @@ func (srv *Server) InitState() error {
 	}
 	srv.newPeers = make(map[wgtypes.Key]time.Time)
 	srv.peerIPs = make(map[wgtypes.Key]netip.Addr)
+	srv.ipipPeers = make(map[netip.Addr]*ipipPeer)
 	return nil
 }
 
@@ -620,6 +626,16 @@ func (srv *Server) StartIptables() error {
 		return fmt.Errorf("failed to add inbound TCP MSS rule: %v", err)
 	}
 
+	// Rules covering this server's IPIP peer interfaces. The interfaces are
+	// created lazily by /connect-ipip, but the FORWARD/MSS rules can be
+	// installed upfront via a wildcard so they are ready when peers attach.
+	if err := srv.iptablesIpipForwardRule(true); err != nil {
+		return fmt.Errorf("failed to add ipip forward rule: %v", err)
+	}
+	if err := srv.iptablesIpipMssRules(true); err != nil {
+		return fmt.Errorf("failed to add ipip MSS rules: %v", err)
+	}
+
 	// SNAT rule for internal network traffic. This is currently only applicable for boxes in
 	// the US.
 	if srv.Region == "us-west" {
@@ -717,6 +733,13 @@ func (srv *Server) CleanupIptables() {
 	}
 	if err := srv.Ipt.Delete("mangle", "FORWARD", tcpMssRule...); err != nil {
 		log.Printf("failed to remove inbound TCP MSS rule: %v", err)
+	}
+
+	if err := srv.iptablesIpipForwardRule(false); err != nil {
+		log.Printf("failed to remove ipip forward rule: %v", err)
+	}
+	if err := srv.iptablesIpipMssRules(false); err != nil {
+		log.Printf("failed to remove ipip MSS rules: %v", err)
 	}
 
 	if srv.Region == "us-west" {
@@ -872,6 +895,7 @@ func (srv *Server) ListenForHttps() error {
 	}
 
 	go srv.removeIdlePeersLoop()
+	go srv.removeIdleIpipPeersLoop()
 
 	// Some bind addresses may not have been added to the network interface. If
 	// that is the case, we need to add it (transiently).
@@ -881,6 +905,7 @@ func (srv *Server) ListenForHttps() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.indexHandler)
 	mux.HandleFunc("/connect", srv.connectHandler)
+	mux.HandleFunc("/connect-ipip", srv.connectIpipHandler)
 
 	cert, err := loadServerTls()
 	if err != nil {

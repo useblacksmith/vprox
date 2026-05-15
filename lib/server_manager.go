@@ -151,6 +151,10 @@ func (sm *ServerManager) Start(ip netip.Addr) error {
 			log.Printf("[%v] failed to start iptables: %v", ip, err)
 			return
 		}
+		// IPIP tunnels have no kernel-adoption path yet (unlike WireGuard,
+		// which RestorePeersFromKernel re-adopts), so tear them down on
+		// shutdown to keep the allocator and kernel state consistent.
+		defer srv.CleanupIpip()
 
 		if err := srv.ListenForHttps(); err != nil {
 			log.Printf("[%v] https server failed: %v", ip, err)
