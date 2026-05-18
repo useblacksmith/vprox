@@ -2,6 +2,7 @@ package lib
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -46,11 +47,12 @@ const ipipIfnameMaxLen = 15
 // also gives us a stable wildcard (vp<idx>-+) for iptables.
 //
 // The function returns an error if the resulting name would exceed
-// IFNAMSIZ. In practice this never fires for sensibly-sized CIDRs (a /6
-// produces at most an 8-char decimal offset, which still fits alongside a
-// 5-char server index), but it's a hard runtime guard against accidentally
-// configuring a CIDR so wide that two peers would silently collide on the
-// same interface name.
+// IFNAMSIZ. This never fires for production-sized CIDRs -- a /16 yields at
+// most a 5-digit offset, well within budget alongside a 5-digit server
+// index -- but it is a hard runtime guard against a CIDR wide enough
+// (roughly /8 or wider, paired with a large server index) that the offset
+// pushes the name past IFNAMSIZ, where kernel truncation could make two
+// distinct peers collide on the same interface name.
 func (srv *Server) ipipIfname(peerIP netip.Addr) (string, error) {
 	base := srv.WgCidr.Addr().As4()
 	p := peerIP.As4()
@@ -110,31 +112,50 @@ func (srv *Server) connectIpipHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Idempotent path: if we already have an IPIP tunnel for this client
-	// IP AND its kernel interface still exists, refresh its lastSeen and
+	// IP and its kernel interface still exists, refresh lastSeen and
 	// return the same assignment. If the interface vanished out-of-band
 	// (manual `ip link del`, kernel reload, etc.) we cannot just refresh
 	// lastSeen: a retrying client would keep the stale entry alive
 	// forever, since removeIdleIpipPeers's freshness guard skips a peer
-	// whose lastSeen was just bumped. Drop the stale entry here and fall
+	// whose lastSeen was just bumped. Drop the stale entry and fall
 	// through to fresh allocation.
 	srv.ipipMu.Lock()
-	if existing, ok := srv.ipipPeers[clientIP]; ok {
-		if _, err := netlink.LinkByName(existing.ifname); err == nil {
-			existing.lastSeen = time.Now()
-			assigned := fmt.Sprintf("%v/%d", existing.peerIP, srv.WgCidr.Bits())
-			srv.ipipMu.Unlock()
-			writeIpipResponse(w, assigned)
-			return
+	existing, ok := srv.ipipPeers[clientIP]
+	srv.ipipMu.Unlock()
+
+	if ok {
+		// Probe the interface without holding ipipMu, so the netlink
+		// syscall doesn't block the idle loop or other requests. Only a
+		// genuine "not found" counts as vanished: a transient lookup
+		// failure must not tear down a working tunnel.
+		_, lookupErr := netlink.LinkByName(existing.ifname)
+		var notFound netlink.LinkNotFoundError
+		vanished := errors.As(lookupErr, &notFound)
+		if lookupErr != nil && !vanished {
+			log.Printf("[%v] ipip iface %s lookup failed transiently (%v); reusing",
+				srv.BindAddr, existing.ifname, lookupErr)
 		}
-		// Interface is gone; reclaim and rebuild.
-		log.Printf("[%v] ipip iface %s for %v vanished; rebuilding",
-			srv.BindAddr, existing.ifname, clientIP)
-		delete(srv.ipipPeers, clientIP)
-		srv.ipipMu.Unlock()
-		srv.removeIpipPeerFilter(existing.ifname, existing.peerIP)
-		srv.ipAllocator.Free(existing.peerIP)
-	} else {
-		srv.ipipMu.Unlock()
+
+		// Re-check identity under the lock: the entry may have been
+		// reaped or replaced while ipipMu was released for the probe.
+		srv.ipipMu.Lock()
+		if current, stillOurs := srv.ipipPeers[clientIP]; !stillOurs || current != existing {
+			// Entry changed under us; fall through to fresh allocation
+			// (the race re-check below reconciles with the winner).
+			srv.ipipMu.Unlock()
+		} else if !vanished {
+			current.lastSeen = time.Now()
+			srv.ipipMu.Unlock()
+			writeIpipResponse(w, fmt.Sprintf("%v/%d", existing.peerIP, srv.WgCidr.Bits()))
+			return
+		} else {
+			delete(srv.ipipPeers, clientIP)
+			srv.ipipMu.Unlock()
+			log.Printf("[%v] ipip iface %s for %v vanished; rebuilding",
+				srv.BindAddr, existing.ifname, clientIP)
+			srv.removeIpipPeerFilter(existing.ifname, existing.peerIP)
+			srv.ipAllocator.Free(existing.peerIP)
+		}
 	}
 
 	peerIP := srv.ipAllocator.Allocate()

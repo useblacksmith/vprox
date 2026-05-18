@@ -137,6 +137,22 @@ func (srv *Server) InitState() error {
 	if reservedIp != srv.WgCidr.Addr() {
 		return fmt.Errorf("reserved IP address mistamches CIDR: %v != %v", reservedIp, srv.WgCidr.Addr())
 	}
+
+	// Fail fast if WgCidr is wide enough that a peer's IPIP interface name
+	// would exceed IFNAMSIZ; otherwise every /connect-ipip request would
+	// 500 at runtime instead. The longest name comes from the last address
+	// of the block.
+	maskedWg := srv.WgCidr.Masked()
+	wgBase := maskedWg.Addr().As4()
+	lastInt := (uint32(wgBase[0])<<24 | uint32(wgBase[1])<<16 |
+		uint32(wgBase[2])<<8 | uint32(wgBase[3])) | (^uint32(0) >> uint(maskedWg.Bits()))
+	lastAddr := netip.AddrFrom4([4]byte{
+		byte(lastInt >> 24), byte(lastInt >> 16), byte(lastInt >> 8), byte(lastInt),
+	})
+	if _, err := srv.ipipIfname(lastAddr); err != nil {
+		return fmt.Errorf("WgCidr %v too wide for IPIP: %v", srv.WgCidr, err)
+	}
+
 	srv.newPeers = make(map[wgtypes.Key]time.Time)
 	srv.peerIPs = make(map[wgtypes.Key]netip.Addr)
 	srv.ipipPeers = make(map[netip.Addr]*ipipPeer)
