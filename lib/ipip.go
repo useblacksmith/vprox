@@ -31,18 +31,41 @@ type connectIpipResponse struct {
 	AssignedAddr string
 }
 
-// ipipIfname returns the Linux interface name used for the IPIP tunnel to the
-// peer at peerIP.
+// ipipIfnameMaxLen is the maximum visible length of a Linux interface name
+// (IFNAMSIZ is 16 including the null terminator).
+const ipipIfnameMaxLen = 15
+
+// ipipIfname returns the Linux interface name used for the IPIP tunnel to
+// the peer at peerIP.
 //
-// The name is "vp<srv.Index>-<host>" where host is the low 16 bits of peerIP.
-// This stays within IFNAMSIZ (15 visible chars) for all valid server indices
-// and host portions of the WgCidr, and makes it possible to install one
-// iptables wildcard rule per server (vp<srv.Index>-+) covering every IPIP
-// peer attached to that server.
-func (srv *Server) ipipIfname(peerIP netip.Addr) string {
-	b := peerIP.As4()
-	host := uint16(b[2])<<8 | uint16(b[3])
-	return fmt.Sprintf("vp%d-%d", srv.Index, host)
+// The name is "vp<srv.Index>-<offset>" where offset is the peer's distance
+// from srv.WgCidr.Addr(). Using the full offset from the CIDR base (rather
+// than e.g. the low 16 bits of peerIP) keeps the suffix globally unique
+// across any allowed WgCidr width: for two distinct peers in the same
+// server's CIDR, their offsets necessarily differ. The "vp<idx>-" prefix
+// also gives us a stable wildcard (vp<idx>-+) for iptables.
+//
+// The function returns an error if the resulting name would exceed
+// IFNAMSIZ. In practice this never fires for sensibly-sized CIDRs (a /6
+// produces at most an 8-char decimal offset, which still fits alongside a
+// 5-char server index), but it's a hard runtime guard against accidentally
+// configuring a CIDR so wide that two peers would silently collide on the
+// same interface name.
+func (srv *Server) ipipIfname(peerIP netip.Addr) (string, error) {
+	base := srv.WgCidr.Addr().As4()
+	p := peerIP.As4()
+	baseInt := uint32(base[0])<<24 | uint32(base[1])<<16 |
+		uint32(base[2])<<8 | uint32(base[3])
+	peerInt := uint32(p[0])<<24 | uint32(p[1])<<16 |
+		uint32(p[2])<<8 | uint32(p[3])
+	offset := peerInt - baseInt
+	name := fmt.Sprintf("vp%d-%d", srv.Index, offset)
+	if len(name) > ipipIfnameMaxLen {
+		return "", fmt.Errorf(
+			"ipip ifname %q exceeds IFNAMSIZ (%d > %d); WgCidr is too wide for IPIP",
+			name, len(name), ipipIfnameMaxLen)
+	}
+	return name, nil
 }
 
 // ipipIfaceWildcard returns the iptables-style wildcard that matches every
@@ -121,7 +144,13 @@ func (srv *Server) connectIpipHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ifname := srv.ipipIfname(peerIP)
+	ifname, err := srv.ipipIfname(peerIP)
+	if err != nil {
+		srv.ipAllocator.Free(peerIP)
+		log.Printf("[%v] %v", srv.BindAddr, err)
+		http.Error(w, "ipip ifname out of range", http.StatusInternalServerError)
+		return
+	}
 	if err := srv.createIpipLink(ifname, clientIP, peerIP); err != nil {
 		srv.ipAllocator.Free(peerIP)
 		log.Printf("[%v] failed to create IPIP tunnel for %v: %v",
