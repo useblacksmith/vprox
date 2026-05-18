@@ -635,6 +635,13 @@ func (srv *Server) StartIptables() error {
 		return fmt.Errorf("failed to add ipip MSS rules: %v", err)
 	}
 
+	// Wildcard guard that drops IPIP traffic destined to the host itself,
+	// so peers can only transit the box and can't reach host-local
+	// services with a forged inner source (see iptablesIpipHostGuardRule).
+	if err := srv.iptablesIpipHostGuardRule(true); err != nil {
+		return fmt.Errorf("failed to add ipip host guard rule: %v", err)
+	}
+
 	// SNAT rule for internal network traffic. This is currently only applicable for boxes in
 	// the US.
 	if srv.Region == "us-west" {
@@ -736,6 +743,10 @@ func (srv *Server) CleanupIptables() {
 
 	if err := srv.iptablesIpipMssRules(false); err != nil {
 		log.Printf("failed to remove ipip MSS rules: %v", err)
+	}
+
+	if err := srv.iptablesIpipHostGuardRule(false); err != nil {
+		log.Printf("failed to remove ipip host guard rule: %v", err)
 	}
 
 	if srv.Region == "us-west" {

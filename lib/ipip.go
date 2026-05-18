@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"os"
 	"time"
 
 	"github.com/vishvananda/netlink"
@@ -221,30 +220,15 @@ func (srv *Server) createIpipLink(ifname string, remote, peerIP netip.Addr) erro
 		return fmt.Errorf("add host route for %v: %v", peerIP, err)
 	}
 
-	// Reverse-path filtering: the kernel drops decapsulated packets whose
-	// inner source IP wouldn't route back through the same interface they
-	// arrived on. Combined with the per-peer /32 route installed above,
-	// this means an attacker who can send IPIP packets to us as some
-	// registered client's outer IP can't inject inner traffic claiming to
-	// be from a different peer's inner IP.
-	//
-	// Linux uses max(conf.all.rp_filter, conf.<iface>.rp_filter): setting
-	// the per-interface value to 1 forces strict filtering unless
-	// conf.all.rp_filter is 2 (loose), in which case this layer degrades
-	// to loose mode and no longer enforces the same-interface check. The
-	// per-peer iptables filter installed below is the authoritative
-	// anti-spoof control regardless; rp_filter is a best-effort backstop.
-	// Log and continue if the sysctl is missing.
-	if err := setRpFilter(ifname, 1); err != nil {
-		log.Printf("[%v] failed to enable rp_filter on %s: %v",
-			srv.BindAddr, ifname, err)
-	}
-
 	// Per-peer iptables filter: only accept forwarded traffic whose inner
 	// source IP matches the peer we assigned this tunnel to, and drop
-	// everything else arriving on this interface. This is defence in depth
-	// alongside rp_filter; it's enforced independently of the routing
-	// table and is more obvious at audit time.
+	// everything else arriving on this interface. A decapsulated IPIP
+	// packet carries an attacker-controlled inner source, so this is what
+	// stops a peer from injecting traffic claiming to be from a different
+	// peer's inner IP. It covers transit (FORWARD) traffic only; packets
+	// terminating on the host itself are handled separately by the
+	// raw/PREROUTING guard installed in StartIptables (see
+	// iptablesIpipHostGuardRule).
 	if err := srv.addIpipPeerFilter(ifname, peerIP); err != nil {
 		_ = netlink.LinkDel(resolved)
 		return fmt.Errorf("install ipip peer filter: %v", err)
@@ -269,13 +253,6 @@ func (srv *Server) tearDownIpipLink(ifname string, peerIP netip.Addr) {
 		log.Printf("[%v] failed to delete ipip link %s: %v",
 			srv.BindAddr, ifname, err)
 	}
-}
-
-// setRpFilter writes the per-interface rp_filter sysctl. The /proc entry
-// exists as soon as the interface is created.
-func setRpFilter(ifname string, val int) error {
-	path := fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/rp_filter", ifname)
-	return os.WriteFile(path, []byte(fmt.Sprintf("%d\n", val)), 0644)
 }
 
 // ipipPeerAcceptRule is the iptables rule that permits forwarded traffic
@@ -338,9 +315,7 @@ func (srv *Server) removeIdleIpipPeersLoop() {
 		case <-time.After(5 * time.Second):
 		}
 
-		if err := srv.removeIdleIpipPeers(); err != nil {
-			log.Printf("error removing idle ipip peers: %v", err)
-		}
+		srv.removeIdleIpipPeers()
 	}
 }
 
@@ -349,7 +324,7 @@ func (srv *Server) removeIdleIpipPeersLoop() {
 // interface's rx_bytes and tx_bytes counters via netlink; counting both
 // directions means a peer in the middle of a one-way transfer (e.g. a
 // download with little return traffic) is not pruned mid-stream.
-func (srv *Server) removeIdleIpipPeers() error {
+func (srv *Server) removeIdleIpipPeers() {
 	srv.ipipMu.Lock()
 	type snapshot struct {
 		clientIP netip.Addr
@@ -428,7 +403,6 @@ func (srv *Server) removeIdleIpipPeers() error {
 		srv.tearDownIpipLink(r.peer.ifname, r.peer.peerIP)
 		srv.ipAllocator.Free(r.peer.peerIP)
 	}
-	return nil
 }
 
 // CleanupIpip tears down every IPIP interface this server created. It is
@@ -487,6 +461,44 @@ func (srv *Server) iptablesIpipMssRules(enabled bool) error {
 	}
 	if err := srv.Ipt.Delete("mangle", "FORWARD", in...); err != nil {
 		log.Printf("failed to remove ipip inbound MSS rule: %v", err)
+	}
+	return nil
+}
+
+// iptablesIpipHostGuardRule adds or removes the wildcard rule that drops
+// traffic arriving on this server's IPIP interfaces and destined to a
+// host-local address.
+//
+// IPIP peers route *through* the box and have no legitimate reason to
+// reach the host itself. A decapsulated inner packet carries an
+// attacker-controlled inner source, and the per-peer FORWARD filter
+// (addIpipPeerFilter) only inspects transit traffic, not packets
+// terminating on the host. Without this rule an authenticated peer could
+// reach host-local services -- notably the vprox HTTPS control plane,
+// whose /connect-ipip handler keys peer identity on the request source
+// address -- with a forged source IP.
+//
+// It lives in raw/PREROUTING so it is evaluated before conntrack and
+// before ufw's filter chains; ufw's accept rules for ports 22/443/etc.
+// therefore cannot shadow it. The legitimate control-plane handshake is
+// unaffected: it arrives on the physical bind interface, not vp<Index>-+.
+func (srv *Server) iptablesIpipHostGuardRule(enabled bool) error {
+	rule := []string{
+		"-i", srv.ipipIfaceWildcard(),
+		"-m", "addrtype", "--dst-type", "LOCAL",
+		"-j", "DROP",
+		"-m", "comment", "--comment",
+		fmt.Sprintf("vprox ipip host guard rule for %s", srv.Ifname()),
+	}
+	if enabled {
+		if err := srv.Ipt.AppendUnique("raw", "PREROUTING", rule...); err != nil {
+			return fmt.Errorf("append ipip host guard rule: %v", err)
+		}
+		return nil
+	}
+
+	if err := srv.Ipt.Delete("raw", "PREROUTING", rule...); err != nil {
+		log.Printf("failed to remove ipip host guard rule: %v", err)
 	}
 	return nil
 }
