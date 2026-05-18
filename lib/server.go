@@ -93,7 +93,7 @@ type Server struct {
 
 	ipAllocator *IpAllocator
 
-	mu sync.Mutex // Protects the fields below.
+	mu sync.Mutex // Protects newPeers and peerIPs.
 	// newPeers records the time of each peer's most recent /connect, granting
 	// a grace period during which the idle reaper won't remove the peer. This
 	// protects peers that haven't completed a WireGuard handshake yet, and
