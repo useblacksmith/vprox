@@ -396,11 +396,20 @@ func (srv *Server) removeIdleIpipPeers() {
 	for _, s := range snaps {
 		link, err := netlink.LinkByName(s.ifname)
 		if err != nil {
-			// The interface vanished out from under us (manual `ip link
-			// del`, kernel reload, etc.). Reap unconditionally; the
-			// freshness guard in the removal loop does not apply because
-			// the entry is unusable regardless of lastSeen.
-			toRemove = append(toRemove, removal{snapshot: s, vanished: true})
+			// Only a genuine "not found" counts as vanished. A
+			// transient lookup failure (kernel resource pressure, brief
+			// netlink glitch, etc.) must NOT tear down an
+			// actively-used tunnel, since vanished entries bypass the
+			// lastSeen freshness guard below. Log and re-check next
+			// poll instead. Matches the discrimination in
+			// connectIpipHandler.
+			var notFound netlink.LinkNotFoundError
+			if errors.As(err, &notFound) {
+				toRemove = append(toRemove, removal{snapshot: s, vanished: true})
+			} else {
+				log.Printf("[%v] ipip iface %s lookup failed transiently (%v); will retry",
+					srv.BindAddr, s.ifname, err)
+			}
 			continue
 		}
 		stats := link.Attrs().Statistics
