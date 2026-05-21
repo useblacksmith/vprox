@@ -274,11 +274,11 @@ func (srv *Server) createIpipLink(ifname string, remote, peerIP netip.Addr) erro
 	// source IP matches the peer we assigned this tunnel to, and drop
 	// everything else arriving on this interface. A decapsulated IPIP
 	// packet carries an attacker-controlled inner source, so this is what
-	// stops a peer from injecting traffic claiming to be from a different
-	// peer's inner IP. It covers transit (FORWARD) traffic only; packets
-	// terminating on the host itself are handled separately by the
-	// raw/PREROUTING guard installed in StartIptables (see
-	// iptablesIpipHostGuardRule).
+	// stops a peer from injecting transit traffic claiming to be from a
+	// different peer's inner IP. Inner packets that terminate on the host
+	// itself go through INPUT instead, where ufw's default deny and
+	// connectIpipHandler's check that the request did not originate from
+	// inside srv.WgCidr together cover the control-plane concern.
 	if err := srv.addIpipPeerFilter(ifname, peerIP); err != nil {
 		_ = netlink.LinkDel(resolved)
 		return fmt.Errorf("install ipip peer filter: %v", err)
@@ -520,44 +520,6 @@ func (srv *Server) iptablesIpipMssRules(enabled bool) error {
 	}
 	if err := srv.Ipt.Delete("mangle", "FORWARD", in...); err != nil {
 		log.Printf("failed to remove ipip inbound MSS rule: %v", err)
-	}
-	return nil
-}
-
-// iptablesIpipHostGuardRule adds or removes the wildcard rule that drops
-// traffic arriving on this server's IPIP interfaces and destined to a
-// host-local address.
-//
-// IPIP peers route *through* the box and have no legitimate reason to
-// reach the host itself. A decapsulated inner packet carries an
-// attacker-controlled inner source, and the per-peer FORWARD filter
-// (addIpipPeerFilter) only inspects transit traffic, not packets
-// terminating on the host. Without this rule an authenticated peer could
-// reach host-local services -- notably the vprox HTTPS control plane,
-// whose /connect-ipip handler keys peer identity on the request source
-// address -- with a forged source IP.
-//
-// It lives in raw/PREROUTING so it is evaluated before conntrack and
-// before ufw's filter chains; ufw's accept rules for ports 22/443/etc.
-// therefore cannot shadow it. The legitimate control-plane handshake is
-// unaffected: it arrives on the physical bind interface, not vp<Index>-+.
-func (srv *Server) iptablesIpipHostGuardRule(enabled bool) error {
-	rule := []string{
-		"-i", srv.ipipIfaceWildcard(),
-		"-m", "addrtype", "--dst-type", "LOCAL",
-		"-j", "DROP",
-		"-m", "comment", "--comment",
-		fmt.Sprintf("vprox ipip host guard rule for %s", srv.Ifname()),
-	}
-	if enabled {
-		if err := srv.Ipt.AppendUnique("raw", "PREROUTING", rule...); err != nil {
-			return fmt.Errorf("append ipip host guard rule: %v", err)
-		}
-		return nil
-	}
-
-	if err := srv.Ipt.Delete("raw", "PREROUTING", rule...); err != nil {
-		log.Printf("failed to remove ipip host guard rule: %v", err)
 	}
 	return nil
 }
