@@ -87,8 +87,11 @@ type Server struct {
 	ipAllocator *IpAllocator
 
 	mu sync.Mutex // Protects the fields below.
-	// newPeers tracks peers that have connected but not yet completed a
-	// WireGuard handshake, so the idle reaper doesn't remove them prematurely.
+	// newPeers records the time of each peer's most recent /connect, granting
+	// a grace period during which the idle reaper won't remove the peer. This
+	// protects peers that haven't completed a WireGuard handshake yet, and
+	// prevents the reaper from racing an in-flight /connect (reaping a peer and
+	// freeing its IP between the handler's IP resolution and its device write).
 	newPeers map[wgtypes.Key]time.Time
 	// peerIPs is the authoritative in-memory index of the IP assigned to each
 	// configured peer. It lets connectHandler resolve an existing peer's IP
@@ -527,13 +530,16 @@ func (srv *Server) removeIdlePeers() error {
 	var removeIps []netip.Addr
 	var removeKeys []wgtypes.Key
 	for _, peer := range device.Peers {
-		var idle bool
-		if peer.LastHandshakeTime.IsZero() {
-			_, isNew := srv.newPeers[peer.PublicKey]
-			idle = !isNew
-		} else {
-			idle = time.Since(peer.LastHandshakeTime) > PeerIdleTimeout
+		// A peer with a live grace entry is never idle: it either connected
+		// recently (handshake may not have happened yet) or has a /connect in
+		// flight, whose handler refreshed newPeers under srv.mu before we
+		// acquired it. Reaping here would free an IP the handler is about to
+		// hand out and desync peerIPs/ipAllocator from the device.
+		if _, hasGrace := srv.newPeers[peer.PublicKey]; hasGrace {
+			continue
 		}
+		idle := peer.LastHandshakeTime.IsZero() ||
+			time.Since(peer.LastHandshakeTime) > PeerIdleTimeout
 
 		if idle {
 			if len(peer.AllowedIPs) > 0 {
