@@ -40,6 +40,13 @@ const FirstHandshakeTimeout = 10 * time.Second
 // setting.
 const PeerIdleTimeout = 5 * time.Minute
 
+// After a /connect, the idle reaper leaves the peer alone for this long even
+// if its last handshake is stale. This covers the window between the handler
+// resolving the peer's IP and writing it to the device, plus the client's
+// subsequent handshake and health checks, so the reaper can't free an IP that
+// an in-flight or just-completed /connect is using.
+const ConnectGracePeriod = 1 * time.Minute
+
 // Server handles state for one WireGuard network.
 //
 // The `vprox server` command should create one Server instance for each
@@ -530,16 +537,19 @@ func (srv *Server) removeIdlePeers() error {
 	var removeIps []netip.Addr
 	var removeKeys []wgtypes.Key
 	for _, peer := range device.Peers {
-		// A peer with a live grace entry is never idle: it either connected
-		// recently (handshake may not have happened yet) or has a /connect in
-		// flight, whose handler refreshed newPeers under srv.mu before we
-		// acquired it. Reaping here would free an IP the handler is about to
-		// hand out and desync peerIPs/ipAllocator from the device.
-		if _, hasGrace := srv.newPeers[peer.PublicKey]; hasGrace {
-			continue
+		lastConnect, hasConnected := srv.newPeers[peer.PublicKey]
+		var idle bool
+		if peer.LastHandshakeTime.IsZero() {
+			idle = !hasConnected
+		} else {
+			// A stale handshake alone isn't enough to reap: a recent /connect
+			// (refreshed under srv.mu before the handler's device write) means
+			// the peer is reconnecting or has a request in flight, and reaping
+			// it would free an IP the handler is handing out, desyncing
+			// peerIPs/ipAllocator from the device.
+			idle = time.Since(peer.LastHandshakeTime) > PeerIdleTimeout &&
+				time.Since(lastConnect) > ConnectGracePeriod
 		}
-		idle := peer.LastHandshakeTime.IsZero() ||
-			time.Since(peer.LastHandshakeTime) > PeerIdleTimeout
 
 		if idle {
 			if len(peer.AllowedIPs) > 0 {
