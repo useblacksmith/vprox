@@ -40,6 +40,13 @@ const FirstHandshakeTimeout = 10 * time.Second
 // setting.
 const PeerIdleTimeout = 5 * time.Minute
 
+// After a /connect, the idle reaper leaves the peer alone for this long even
+// if its last handshake is stale. This covers the window between the handler
+// resolving the peer's IP and writing it to the device, plus the client's
+// subsequent handshake and health checks, so the reaper can't free an IP that
+// an in-flight or just-completed /connect is using.
+const ConnectGracePeriod = 1 * time.Minute
+
 // Server handles state for one WireGuard network.
 //
 // The `vprox server` command should create one Server instance for each
@@ -86,8 +93,20 @@ type Server struct {
 
 	ipAllocator *IpAllocator
 
-	mu       sync.Mutex // Protects the fields below.
+	mu sync.Mutex // Protects the fields below.
+	// newPeers records the time of each peer's most recent /connect, granting
+	// a grace period during which the idle reaper won't remove the peer. This
+	// protects peers that haven't completed a WireGuard handshake yet, and
+	// prevents the reaper from racing an in-flight /connect (reaping a peer and
+	// freeing its IP between the handler's IP resolution and its device write).
 	newPeers map[wgtypes.Key]time.Time
+	// peerIPs is the authoritative in-memory index of the IP assigned to each
+	// configured peer. It lets connectHandler resolve an existing peer's IP
+	// without dumping the entire WireGuard device (an O(peers) netlink call)
+	// on every /connect request. It is kept in sync with ipAllocator and the
+	// kernel device: an entry is added when a peer is allocated an IP and
+	// removed when the reaper deletes an idle peer.
+	peerIPs map[wgtypes.Key]netip.Addr
 }
 
 // InitState initializes the private server state.
@@ -114,6 +133,7 @@ func (srv *Server) InitState() error {
 		return fmt.Errorf("reserved IP address mistamches CIDR: %v != %v", reservedIp, srv.WgCidr.Addr())
 	}
 	srv.newPeers = make(map[wgtypes.Key]time.Time)
+	srv.peerIPs = make(map[wgtypes.Key]netip.Addr)
 	return nil
 }
 
@@ -165,36 +185,31 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If the new connection already exists as a peer, just return that IP.
-	peerIp := netip.AddrFrom4([4]byte{})
-
-	device, err := srv.WgClient.Device(srv.Ifname())
-	if err != nil {
-		http.Error(w, "failed to get WireGuard device", http.StatusInternalServerError)
-	}
-	for _, peer := range device.Peers {
-		if peer.PublicKey == peerKey && len(peer.AllowedIPs) > 0 {
-			peerIp, _ = netip.AddrFromSlice([]byte(peer.AllowedIPs[0].IP.To4()))
-			break
-		}
-	}
-
-	// Add a WireGuard peer for the new connection.
-	if peerIp.IsUnspecified() {
-		peerIp = srv.ipAllocator.Allocate()
-	}
-	if peerIp.IsUnspecified() {
-		log.Printf("no more ip addresses available in %v", srv.WgCidr)
-		http.Error(w, "no more IP addresses available", http.StatusServiceUnavailable)
-		return
-	}
-
+	// Resolve the peer's IP. If it already has one, reuse it; otherwise
+	// allocate a new one. This is done under the lock using the in-memory
+	// peerIPs index so we avoid an O(peers) WireGuard device dump on the
+	// /connect hot path.
 	srv.mu.Lock()
+	peerIp, isExisting := srv.peerIPs[peerKey]
+	if !isExisting {
+		peerIp = srv.ipAllocator.Allocate()
+		if peerIp.IsUnspecified() {
+			srv.mu.Unlock()
+			log.Printf("no more ip addresses available in %v", srv.WgCidr)
+			http.Error(w, "no more IP addresses available", http.StatusServiceUnavailable)
+			return
+		}
+		srv.peerIPs[peerKey] = peerIp
+	}
+	// Refresh the grace period before the idle reaper may remove this peer,
+	// covering both brand-new peers and reconnecting ones.
 	srv.newPeers[peerKey] = time.Now()
 	srv.mu.Unlock()
 
 	clientIp := strings.Split(r.RemoteAddr, ":")[0] // for logging
-	log.Printf("[%v] new peer %v at %v: %v", srv.BindAddr, clientIp, peerIp, peerKey)
+	if !isExisting {
+		log.Printf("[%v] new peer %v at %v: %v", srv.BindAddr, clientIp, peerIp, peerKey)
+	}
 	err = srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{
 		Peers: []wgtypes.PeerConfig{
 			{
@@ -205,7 +220,14 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 		},
 	})
 	if err != nil {
-		srv.ipAllocator.Free(peerIp)
+		// Roll back the allocation we just made so state stays consistent.
+		if !isExisting {
+			srv.mu.Lock()
+			delete(srv.peerIPs, peerKey)
+			delete(srv.newPeers, peerKey)
+			srv.mu.Unlock()
+			srv.ipAllocator.Free(peerIp)
+		}
 		log.Printf("failed to configure WireGuard peer: %v", err)
 		http.Error(w, "failed to configure WireGuard peer", http.StatusInternalServerError)
 		return
@@ -513,13 +535,20 @@ func (srv *Server) removeIdlePeers() error {
 
 	var removePeers []wgtypes.PeerConfig
 	var removeIps []netip.Addr
+	var removeKeys []wgtypes.Key
 	for _, peer := range device.Peers {
+		lastConnect, hasConnected := srv.newPeers[peer.PublicKey]
 		var idle bool
 		if peer.LastHandshakeTime.IsZero() {
-			_, isNew := srv.newPeers[peer.PublicKey]
-			idle = !isNew
+			idle = !hasConnected
 		} else {
-			idle = time.Since(peer.LastHandshakeTime) > PeerIdleTimeout
+			// A stale handshake alone isn't enough to reap: a recent /connect
+			// (refreshed under srv.mu before the handler's device write) means
+			// the peer is reconnecting or has a request in flight, and reaping
+			// it would free an IP the handler is handing out, desyncing
+			// peerIPs/ipAllocator from the device.
+			idle = time.Since(peer.LastHandshakeTime) > PeerIdleTimeout &&
+				time.Since(lastConnect) > ConnectGracePeriod
 		}
 
 		if idle {
@@ -535,6 +564,7 @@ func (srv *Server) removeIdlePeers() error {
 				PublicKey: peer.PublicKey,
 				Remove:    true,
 			})
+			removeKeys = append(removeKeys, peer.PublicKey)
 		}
 	}
 
@@ -545,6 +575,11 @@ func (srv *Server) removeIdlePeers() error {
 		}
 		for _, ip := range removeIps {
 			srv.ipAllocator.Free(ip)
+		}
+		// Drop in-memory index entries so future reconnects from these peers
+		// allocate fresh IPs and stay consistent with the device and allocator.
+		for _, key := range removeKeys {
+			delete(srv.peerIPs, key)
 		}
 	}
 
