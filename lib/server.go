@@ -254,25 +254,62 @@ func (srv *Server) Ifname() string {
 	return fmt.Sprintf("vprox%d", srv.Index)
 }
 
+// StartWireguard brings up the server's WireGuard interface.
+//
+// If an interface with the expected name already exists (e.g. left behind by
+// a previous vprox process across a restart), it is adopted rather than
+// recreated, so that its kernel peer list, and therefore the tunnels of every
+// registered peer, survive the restart. The interface is only deleted and
+// recreated if its address doesn't match the expected CIDR, as a safety net
+// for configuration changes.
 func (srv *Server) StartWireguard() error {
 	ifname := srv.Ifname()
-	link := &linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: ifname}}
-	_ = netlink.LinkDel(link) // remove if it already exists
-	err := netlink.LinkAdd(link)
-	if err != nil {
-		return fmt.Errorf("failed to create WireGuard device: %v", err)
+
+	link, err := netlink.LinkByName(ifname)
+	if err == nil {
+		if srv.canAdoptLink(link) {
+			log.Printf("[%v] adopting existing WireGuard device %s", srv.BindAddr, ifname)
+		} else {
+			log.Printf("[%v] existing device %s doesn't match config; recreating it",
+				srv.BindAddr, ifname)
+			_ = netlink.LinkDel(link)
+			link = nil
+		}
+	} else {
+		link = nil
+	}
+
+	created := false
+	if link == nil {
+		wgLink := &linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: ifname}}
+		if err := netlink.LinkAdd(wgLink); err != nil {
+			return fmt.Errorf("failed to create WireGuard device: %v", err)
+		}
+		link = wgLink
+		created = true
+	}
+
+	// The remaining steps are non-destructive to existing peers: AddrReplace
+	// is idempotent, and ConfigureDevice without ReplacePeers leaves the
+	// kernel peer list untouched. On failure, only delete the device if we
+	// created it ourselves; deleting an adopted device would kill live
+	// tunnels.
+	cleanupOnError := func() {
+		if created {
+			_ = netlink.LinkDel(link)
+		}
 	}
 
 	ipnet := prefixToIPNet(srv.WgCidr)
-	err = netlink.AddrAdd(link, &netlink.Addr{IPNet: &ipnet})
+	err = netlink.AddrReplace(link, &netlink.Addr{IPNet: &ipnet})
 	if err != nil {
-		netlink.LinkDel(link)
+		cleanupOnError()
 		return fmt.Errorf("failed to add address to WireGuard device: %v", err)
 	}
 
 	err = netlink.LinkSetUp(link)
 	if err != nil {
-		netlink.LinkDel(link)
+		cleanupOnError()
 		return fmt.Errorf("failed to bring up WireGuard device: %v", err)
 	}
 
@@ -282,10 +319,132 @@ func (srv *Server) StartWireguard() error {
 		ListenPort: &listenPort,
 	})
 	if err != nil {
-		netlink.LinkDel(link)
+		cleanupOnError()
 		return err
 	}
 
+	return nil
+}
+
+// canAdoptLink reports whether an existing link can be adopted as this
+// server's WireGuard interface: it must be a WireGuard device whose address
+// matches the server's peer CIDR.
+func (srv *Server) canAdoptLink(link netlink.Link) bool {
+	if link.Type() != "wireguard" {
+		return false
+	}
+	addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
+	if err != nil {
+		return false
+	}
+	want := prefixToIPNet(srv.WgCidr)
+	wantOnes, _ := want.Mask.Size()
+	for _, addr := range addrs {
+		if addr.IPNet == nil {
+			continue
+		}
+		ones, _ := addr.Mask.Size()
+		if addr.IP.Equal(want.IP) && ones == wantOnes {
+			return true
+		}
+	}
+	return false
+}
+
+// restoredPeers holds the result of rebuilding in-memory peer state from a
+// kernel WireGuard device dump.
+type restoredPeers struct {
+	// peerIPs maps each valid peer to its assigned IP.
+	peerIPs map[wgtypes.Key]netip.Addr
+	// invalid lists peers whose AllowedIPs don't encode a valid assigned IP;
+	// they should be removed from the device.
+	invalid []wgtypes.Key
+}
+
+// restorePeerState rebuilds peer-to-IP assignments from a kernel WireGuard
+// peer list, claiming each assigned IP in the allocator. A peer is valid if
+// its first AllowedIP is an IPv4 /32 whose address can be claimed (inside the
+// allocator's prefix and not already taken). Invalid peers are returned for
+// removal so in-memory state and the kernel device stay consistent.
+func restorePeerState(peers []wgtypes.Peer, alloc *IpAllocator) restoredPeers {
+	result := restoredPeers{peerIPs: make(map[wgtypes.Key]netip.Addr)}
+	for _, peer := range peers {
+		addr, ok := peerAssignedIp(peer)
+		if !ok || !alloc.Claim(addr) {
+			result.invalid = append(result.invalid, peer.PublicKey)
+			continue
+		}
+		result.peerIPs[peer.PublicKey] = addr
+	}
+	return result
+}
+
+// peerAssignedIp extracts the IP assigned to a peer from its AllowedIPs,
+// which vprox always writes as a single IPv4 /32.
+func peerAssignedIp(peer wgtypes.Peer) (netip.Addr, bool) {
+	if len(peer.AllowedIPs) == 0 {
+		return netip.Addr{}, false
+	}
+	ipnet := peer.AllowedIPs[0]
+	ipv4 := ipnet.IP.To4()
+	if ipv4 == nil {
+		return netip.Addr{}, false
+	}
+	if ones, bits := ipnet.Mask.Size(); ones != 32 || bits != 32 {
+		return netip.Addr{}, false
+	}
+	return netip.AddrFrom4([4]byte(ipv4)), true
+}
+
+// RestorePeersFromKernel rebuilds the in-memory peer index (peerIPs,
+// ipAllocator, newPeers) from the kernel WireGuard device's peer list. It is
+// called once on startup, after StartWireguard adopts an interface that
+// survived a restart, so that:
+//
+//   - existing peers keep their IPs and the allocator never hands an
+//     already-assigned IP to a new peer (which would silently steal the
+//     existing peer's AllowedIPs routing and blackhole it), and
+//   - the idle reaper grants restored peers the usual grace period instead of
+//     instantly reaping ones whose last handshake predates the restart.
+func (srv *Server) RestorePeersFromKernel() error {
+	device, err := srv.WgClient.Device(srv.Ifname())
+	if err != nil {
+		return fmt.Errorf("failed to get WireGuard device: %v", err)
+	}
+	if len(device.Peers) == 0 {
+		return nil
+	}
+
+	restored := restorePeerState(device.Peers, srv.ipAllocator)
+
+	now := time.Now()
+	srv.mu.Lock()
+	for key, addr := range restored.peerIPs {
+		srv.peerIPs[key] = addr
+		srv.newPeers[key] = now
+	}
+	srv.mu.Unlock()
+
+	if len(restored.peerIPs) > 0 {
+		log.Printf("[%v] restored %d peer(s) from existing WireGuard device",
+			srv.BindAddr, len(restored.peerIPs))
+	}
+
+	// Remove peers with missing or malformed AllowedIPs from the device.
+	// These shouldn't exist, but dropping them keeps in-memory state
+	// consistent with the kernel.
+	if len(restored.invalid) > 0 {
+		removals := make([]wgtypes.PeerConfig, 0, len(restored.invalid))
+		for _, key := range restored.invalid {
+			log.Printf("[%v] removing peer with invalid allowed IPs during restore: %v",
+				srv.BindAddr, key)
+			removals = append(removals, wgtypes.PeerConfig{PublicKey: key, Remove: true})
+		}
+		err := srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{Peers: removals})
+		if err != nil {
+			return fmt.Errorf("failed to remove invalid peers: %v", err)
+		}
+	}
 	return nil
 }
 

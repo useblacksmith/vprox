@@ -130,17 +130,27 @@ func (sm *ServerManager) Start(ip netip.Addr) error {
 		defer sm.waitGroup.Done()
 		defer sm.freeIndex(i)
 
+		// Note: we intentionally do NOT clean up the WireGuard interface or
+		// iptables rules on shutdown. The kernel dataplane keeps forwarding
+		// for existing peers while the process is down, which makes restarts
+		// (i.e. deploys) hitless. On startup, StartWireguard adopts the
+		// surviving interface and RestorePeersFromKernel rebuilds the
+		// in-memory peer state from it. CleanupWireguard/CleanupIptables
+		// remain available for manual decommissioning.
 		if err := srv.StartWireguard(); err != nil {
 			log.Printf("[%v] failed to start WireGuard: %v", ip, err)
 			return
 		}
-		defer srv.CleanupWireguard()
+
+		if err := srv.RestorePeersFromKernel(); err != nil {
+			log.Printf("[%v] failed to restore peers from kernel: %v", ip, err)
+			return
+		}
 
 		if err := srv.StartIptables(); err != nil {
 			log.Printf("[%v] failed to start iptables: %v", ip, err)
 			return
 		}
-		defer srv.CleanupIptables()
 
 		if err := srv.ListenForHttps(); err != nil {
 			log.Printf("[%v] https server failed: %v", ip, err)
