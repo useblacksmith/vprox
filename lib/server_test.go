@@ -57,6 +57,36 @@ func TestRestorePeerState(t *testing.T) {
 	assert.Equal(t, []wgtypes.Key{k6}, dup.invalid)
 }
 
+func TestStaleInternalSnatRuleIds(t *testing.T) {
+	wgCidr := netip.MustParsePrefix("10.1.0.1/24")
+	bindAddr := netip.MustParseAddr("192.168.1.10")
+
+	snatRule := func(source, toSource string) string {
+		return "-A POSTROUTING -s " + source + " -d 10.0.0.0/8 -o eth1" +
+			` -m comment --comment "` + internalSnatRuleComment + `"` +
+			" -j SNAT --to-source " + toSource
+	}
+
+	rules := []string{
+		"-P POSTROUTING ACCEPT",
+		// Stale: our subnet, old bind address.
+		snatRule("10.1.0.0/24", "192.168.1.9"),
+		// Stale: old bind address that is a prefix of the current one.
+		snatRule("10.1.0.0/24", "192.168.1.1"),
+		// Current rule; must be kept.
+		snatRule("10.1.0.0/24", "192.168.1.10"),
+		// Another server's subnet; must be kept.
+		snatRule("10.2.0.0/24", "192.168.1.9"),
+		// Unrelated rule without the vprox comment; must be kept.
+		"-A POSTROUTING -s 10.1.0.0/24 -j SNAT --to-source 192.168.1.9",
+	}
+
+	// Ids are rule numbers in descending order so deletes don't shift them.
+	assert.Equal(t, []int{2, 1}, staleInternalSnatRuleIds(rules, wgCidr, bindAddr))
+
+	assert.Empty(t, staleInternalSnatRuleIds([]string{"-P POSTROUTING ACCEPT"}, wgCidr, bindAddr))
+}
+
 func TestPeerAssignedIp(t *testing.T) {
 	key := mustKey(t)
 

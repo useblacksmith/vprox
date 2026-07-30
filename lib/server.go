@@ -483,6 +483,50 @@ func (srv *Server) iptablesSnatRule(enabled bool) error {
 	}
 }
 
+// internalSnatRuleComment tags the nat POSTROUTING rule that SNATs traffic
+// from the WireGuard subnet to the internal network.
+const internalSnatRuleComment = "SNAT for WireGuard to internal network"
+
+// staleInternalSnatRuleIds returns the rule numbers (descending, so they stay
+// valid while deleting one by one) of internal-network SNAT rules for wgCidr
+// whose SNAT target is not bindAddr. rules is an `iptables -S` listing of nat
+// POSTROUTING, where index 0 is the chain policy and the rule at index i has
+// rule number i. Such rules survive a restart when a server index is reused
+// with a different bind address; since AppendUnique adds the new rule after
+// them, they would keep matching internal traffic and SNAT it to the stale
+// address.
+func staleInternalSnatRuleIds(rules []string, wgCidr netip.Prefix, bindAddr netip.Addr) []int {
+	// iptables normalizes the source to the masked network address.
+	source := fmt.Sprintf("-s %s ", wgCidr.Masked().String())
+	target := fmt.Sprintf("--to-source %s ", bindAddr.String())
+	var ids []int
+	for i := len(rules) - 1; i >= 1; i-- {
+		rule := rules[i] + " "
+		if strings.Contains(rule, internalSnatRuleComment) &&
+			strings.Contains(rule, source) &&
+			!strings.Contains(rule, target) {
+			ids = append(ids, i)
+		}
+	}
+	return ids
+}
+
+// cleanupStaleInternalSnatRules removes internal-network SNAT rules for this
+// server's WireGuard subnet that target a different bind address.
+func (srv *Server) cleanupStaleInternalSnatRules() error {
+	rules, err := srv.Ipt.List("nat", "POSTROUTING")
+	if err != nil {
+		return fmt.Errorf("failed to list nat POSTROUTING rules: %v", err)
+	}
+	for _, id := range staleInternalSnatRuleIds(rules, srv.WgCidr, srv.BindAddr) {
+		log.Printf("[%v] removing stale internal SNAT rule: %v", srv.BindAddr, rules[id])
+		if err := srv.Ipt.DeleteById("nat", "POSTROUTING", id); err != nil {
+			return fmt.Errorf("failed to delete stale SNAT rule: %v", err)
+		}
+	}
+	return nil
+}
+
 func (srv *Server) StartIptables() error {
 	// Add masquerade rule for the outbound interface.
 	rule := []string{
@@ -532,12 +576,21 @@ func (srv *Server) StartIptables() error {
 	// SNAT rule for internal network traffic. This is currently only applicable for boxes in
 	// the US.
 	if srv.Region == "us-west" {
+		// Shutdown intentionally leaves iptables rules in place (see
+		// ServerManager.Start), so if this server's index was previously
+		// bound to a different address, a stale SNAT rule targeting the old
+		// address would precede the one added below and keep matching
+		// internal traffic. Remove any such rules first.
+		if err := srv.cleanupStaleInternalSnatRules(); err != nil {
+			return err
+		}
+
 		rule = []string{
 			"-s", srv.WgCidr.String(),
 			"-d", srv.InternalNetworkCidr,
 			"-o", srv.InternalBindIface.Attrs().Name,
 			"-j", "SNAT", "--to-source", srv.BindAddr.String(),
-			"-m", "comment", "--comment", "SNAT for WireGuard to internal network",
+			"-m", "comment", "--comment", internalSnatRuleComment,
 		}
 		if err := srv.Ipt.AppendUnique("nat", "POSTROUTING", rule...); err != nil {
 			return fmt.Errorf("failed to add SNAT rule: %v", err)
