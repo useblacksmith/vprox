@@ -57,7 +57,7 @@ func TestRestorePeerState(t *testing.T) {
 	assert.Equal(t, []wgtypes.Key{k6}, dup.invalid)
 }
 
-func TestStaleInternalSnatRuleIds(t *testing.T) {
+func TestStaleInternalSnatRules(t *testing.T) {
 	wgCidr := netip.MustParsePrefix("10.1.0.1/24")
 	bindAddr := netip.MustParseAddr("192.168.1.10")
 
@@ -65,6 +65,13 @@ func TestStaleInternalSnatRuleIds(t *testing.T) {
 		return "-A POSTROUTING -s " + source + " -d 10.0.0.0/8 -o eth1" +
 			` -m comment --comment "` + internalSnatRuleComment + `"` +
 			" -j SNAT --to-source " + toSource
+	}
+	snatSpec := func(source, toSource string) []string {
+		return []string{
+			"-s", source, "-d", "10.0.0.0/8", "-o", "eth1",
+			"-m", "comment", "--comment", internalSnatRuleComment,
+			"-j", "SNAT", "--to-source", toSource,
+		}
 	}
 
 	rules := []string{
@@ -81,10 +88,29 @@ func TestStaleInternalSnatRuleIds(t *testing.T) {
 		"-A POSTROUTING -s 10.1.0.0/24 -j SNAT --to-source 192.168.1.9",
 	}
 
-	// Ids are rule numbers in descending order so deletes don't shift them.
-	assert.Equal(t, []int{2, 1}, staleInternalSnatRuleIds(rules, wgCidr, bindAddr))
+	// Stale rules are returned as full rule specs for match-based deletion,
+	// with the quoted comment unwrapped into a single argument.
+	assert.Equal(t, [][]string{
+		snatSpec("10.1.0.0/24", "192.168.1.9"),
+		snatSpec("10.1.0.0/24", "192.168.1.1"),
+	}, staleInternalSnatRules(rules, wgCidr, bindAddr))
 
-	assert.Empty(t, staleInternalSnatRuleIds([]string{"-P POSTROUTING ACCEPT"}, wgCidr, bindAddr))
+	assert.Empty(t, staleInternalSnatRules([]string{"-P POSTROUTING ACCEPT"}, wgCidr, bindAddr))
+}
+
+func TestIptablesRuleSpec(t *testing.T) {
+	assert.Equal(t,
+		[]string{"-s", "10.1.0.0/24", "-m", "comment", "--comment", "two words", "-j", "ACCEPT"},
+		iptablesRuleSpec(`-A POSTROUTING -s 10.1.0.0/24 -m comment --comment "two words" -j ACCEPT`))
+
+	// Backslash escapes inside quotes are resolved.
+	assert.Equal(t,
+		[]string{"-m", "comment", "--comment", `say "hi"`, "-j", "ACCEPT"},
+		iptablesRuleSpec(`-A FORWARD -m comment --comment "say \"hi\"" -j ACCEPT`))
+
+	// Non-append lines (e.g. chain policies) are not rule specs.
+	assert.Nil(t, iptablesRuleSpec("-P POSTROUTING ACCEPT"))
+	assert.Nil(t, iptablesRuleSpec(""))
 }
 
 func TestPeerAssignedIp(t *testing.T) {

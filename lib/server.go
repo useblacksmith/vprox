@@ -487,40 +487,87 @@ func (srv *Server) iptablesSnatRule(enabled bool) error {
 // from the WireGuard subnet to the internal network.
 const internalSnatRuleComment = "SNAT for WireGuard to internal network"
 
-// staleInternalSnatRuleIds returns the rule numbers (descending, so they stay
-// valid while deleting one by one) of internal-network SNAT rules for wgCidr
-// whose SNAT target is not bindAddr. rules is an `iptables -S` listing of nat
-// POSTROUTING, where index 0 is the chain policy and the rule at index i has
-// rule number i. Such rules survive a restart when a server index is reused
+// staleInternalSnatRules returns the rule specs (the arguments after
+// "-A POSTROUTING") of internal-network SNAT rules for wgCidr whose SNAT
+// target is not bindAddr. rules is an `iptables -S` listing of nat
+// POSTROUTING. Such rules survive a restart when a server index is reused
 // with a different bind address; since AppendUnique adds the new rule after
 // them, they would keep matching internal traffic and SNAT it to the stale
 // address.
-func staleInternalSnatRuleIds(rules []string, wgCidr netip.Prefix, bindAddr netip.Addr) []int {
+func staleInternalSnatRules(rules []string, wgCidr netip.Prefix, bindAddr netip.Addr) [][]string {
 	// iptables normalizes the source to the masked network address.
 	source := fmt.Sprintf("-s %s ", wgCidr.Masked().String())
 	target := fmt.Sprintf("--to-source %s ", bindAddr.String())
-	var ids []int
-	for i := len(rules) - 1; i >= 1; i-- {
-		rule := rules[i] + " "
-		if strings.Contains(rule, internalSnatRuleComment) &&
-			strings.Contains(rule, source) &&
-			!strings.Contains(rule, target) {
-			ids = append(ids, i)
+	var specs [][]string
+	for _, rule := range rules {
+		padded := rule + " "
+		if strings.Contains(padded, internalSnatRuleComment) &&
+			strings.Contains(padded, source) &&
+			!strings.Contains(padded, target) {
+			if spec := iptablesRuleSpec(rule); spec != nil {
+				specs = append(specs, spec)
+			}
 		}
 	}
-	return ids
+	return specs
+}
+
+// iptablesRuleSpec parses an `iptables -S` "-A <chain> ..." line into the
+// rule's argument list (without the leading "-A <chain>"), suitable for a
+// match-based delete. Double-quoted tokens (e.g. comments containing spaces)
+// are unquoted and backslash escapes are resolved. Returns nil for lines that
+// are not append rules, such as the "-P <chain> <policy>" line.
+func iptablesRuleSpec(rule string) []string {
+	var args []string
+	var cur strings.Builder
+	inQuotes := false
+	escaped := false
+	inToken := false
+	for _, r := range rule {
+		switch {
+		case escaped:
+			cur.WriteRune(r)
+			escaped = false
+		case r == '\\':
+			escaped = true
+		case r == '"':
+			inQuotes = !inQuotes
+			inToken = true
+		case r == ' ' && !inQuotes:
+			if inToken {
+				args = append(args, cur.String())
+				cur.Reset()
+				inToken = false
+			}
+		default:
+			cur.WriteRune(r)
+			inToken = true
+		}
+	}
+	if inToken {
+		args = append(args, cur.String())
+	}
+	if len(args) < 2 || args[0] != "-A" {
+		return nil
+	}
+	return args[2:]
 }
 
 // cleanupStaleInternalSnatRules removes internal-network SNAT rules for this
-// server's WireGuard subnet that target a different bind address.
+// server's WireGuard subnet that target a different bind address. Deletion is
+// by exact rule match rather than by rule number: each server runs
+// StartIptables in its own goroutine against the shared iptables handle, so
+// deleting by number races with concurrent inserts/deletes shifting the
+// numbering. Match-based deletes are unaffected, and rules for other servers'
+// subnets never match this server's specs.
 func (srv *Server) cleanupStaleInternalSnatRules() error {
 	rules, err := srv.Ipt.List("nat", "POSTROUTING")
 	if err != nil {
 		return fmt.Errorf("failed to list nat POSTROUTING rules: %v", err)
 	}
-	for _, id := range staleInternalSnatRuleIds(rules, srv.WgCidr, srv.BindAddr) {
-		log.Printf("[%v] removing stale internal SNAT rule: %v", srv.BindAddr, rules[id])
-		if err := srv.Ipt.DeleteById("nat", "POSTROUTING", id); err != nil {
+	for _, spec := range staleInternalSnatRules(rules, srv.WgCidr, srv.BindAddr) {
+		log.Printf("[%v] removing stale internal SNAT rule: %v", srv.BindAddr, strings.Join(spec, " "))
+		if err := srv.Ipt.DeleteIfExists("nat", "POSTROUTING", spec...); err != nil {
 			return fmt.Errorf("failed to delete stale SNAT rule: %v", err)
 		}
 	}
