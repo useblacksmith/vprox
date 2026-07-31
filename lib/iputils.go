@@ -185,6 +185,27 @@ func (ipa *IpAllocator) Allocate() netip.Addr {
 	}
 }
 
+// Claim marks the given specific IP address as allocated, so that Allocate
+// will never hand it out. It is used to rebuild allocator state from an
+// external source of truth (e.g. the kernel WireGuard peer list after a
+// restart).
+//
+// It returns false, without modifying state, if the address is outside the
+// allocator's prefix or is already allocated.
+func (ipa *IpAllocator) Claim(addr netip.Addr) bool {
+	ipa.mu.Lock()
+	defer ipa.mu.Unlock()
+
+	if !ipa.prefix.Contains(addr) {
+		return false
+	}
+	if _, ok := ipa.allocated[addr]; ok {
+		return false
+	}
+	ipa.allocated[addr] = struct{}{}
+	return true
+}
+
 // Free marks the given IP address as available for allocation.
 func (ipa *IpAllocator) Free(addr netip.Addr) bool {
 	ipa.mu.Lock()

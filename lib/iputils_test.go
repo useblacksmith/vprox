@@ -7,6 +7,32 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestIpAllocatorClaim(t *testing.T) {
+	ipa := NewIpAllocator(netip.MustParsePrefix("192.168.0.0/24"))
+
+	// Claiming a free address succeeds; claiming it again fails.
+	addr := netip.MustParseAddr("192.168.0.5")
+	assert.True(t, ipa.Claim(addr))
+	assert.False(t, ipa.Claim(addr))
+
+	// Claiming an address outside the prefix fails.
+	assert.False(t, ipa.Claim(netip.MustParseAddr("192.168.1.5")))
+
+	// Claiming an address returned by Allocate fails.
+	first := ipa.Allocate()
+	assert.Equal(t, netip.MustParseAddr("192.168.0.1"), first)
+	assert.False(t, ipa.Claim(first))
+
+	// Allocate skips claimed addresses.
+	assert.True(t, ipa.Claim(netip.MustParseAddr("192.168.0.2")))
+	assert.True(t, ipa.Claim(netip.MustParseAddr("192.168.0.3")))
+	assert.Equal(t, netip.MustParseAddr("192.168.0.4"), ipa.Allocate())
+
+	// A freed address can be claimed again.
+	assert.True(t, ipa.Free(addr))
+	assert.True(t, ipa.Claim(addr))
+}
+
 func TestAfterOneIpBlock(t *testing.T) {
 	ip1 := netip.AddrFrom4([4]byte{192, 168, 1, 0})
 	ip2 := netip.AddrFrom4([4]byte{192, 168, 2, 0})

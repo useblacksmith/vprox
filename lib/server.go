@@ -254,25 +254,62 @@ func (srv *Server) Ifname() string {
 	return fmt.Sprintf("vprox%d", srv.Index)
 }
 
+// StartWireguard brings up the server's WireGuard interface.
+//
+// If an interface with the expected name already exists (e.g. left behind by
+// a previous vprox process across a restart), it is adopted rather than
+// recreated, so that its kernel peer list, and therefore the tunnels of every
+// registered peer, survive the restart. The interface is only deleted and
+// recreated if its address doesn't match the expected CIDR, as a safety net
+// for configuration changes.
 func (srv *Server) StartWireguard() error {
 	ifname := srv.Ifname()
-	link := &linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: ifname}}
-	_ = netlink.LinkDel(link) // remove if it already exists
-	err := netlink.LinkAdd(link)
-	if err != nil {
-		return fmt.Errorf("failed to create WireGuard device: %v", err)
+
+	link, err := netlink.LinkByName(ifname)
+	if err == nil {
+		if srv.canAdoptLink(link) {
+			log.Printf("[%v] adopting existing WireGuard device %s", srv.BindAddr, ifname)
+		} else {
+			log.Printf("[%v] existing device %s doesn't match config; recreating it",
+				srv.BindAddr, ifname)
+			_ = netlink.LinkDel(link)
+			link = nil
+		}
+	} else {
+		link = nil
+	}
+
+	created := false
+	if link == nil {
+		wgLink := &linkWireguard{LinkAttrs: netlink.LinkAttrs{Name: ifname}}
+		if err := netlink.LinkAdd(wgLink); err != nil {
+			return fmt.Errorf("failed to create WireGuard device: %v", err)
+		}
+		link = wgLink
+		created = true
+	}
+
+	// The remaining steps are non-destructive to existing peers: AddrReplace
+	// is idempotent, and ConfigureDevice without ReplacePeers leaves the
+	// kernel peer list untouched. On failure, only delete the device if we
+	// created it ourselves; deleting an adopted device would kill live
+	// tunnels.
+	cleanupOnError := func() {
+		if created {
+			_ = netlink.LinkDel(link)
+		}
 	}
 
 	ipnet := prefixToIPNet(srv.WgCidr)
-	err = netlink.AddrAdd(link, &netlink.Addr{IPNet: &ipnet})
+	err = netlink.AddrReplace(link, &netlink.Addr{IPNet: &ipnet})
 	if err != nil {
-		netlink.LinkDel(link)
+		cleanupOnError()
 		return fmt.Errorf("failed to add address to WireGuard device: %v", err)
 	}
 
 	err = netlink.LinkSetUp(link)
 	if err != nil {
-		netlink.LinkDel(link)
+		cleanupOnError()
 		return fmt.Errorf("failed to bring up WireGuard device: %v", err)
 	}
 
@@ -282,10 +319,132 @@ func (srv *Server) StartWireguard() error {
 		ListenPort: &listenPort,
 	})
 	if err != nil {
-		netlink.LinkDel(link)
+		cleanupOnError()
 		return err
 	}
 
+	return nil
+}
+
+// canAdoptLink reports whether an existing link can be adopted as this
+// server's WireGuard interface: it must be a WireGuard device whose address
+// matches the server's peer CIDR.
+func (srv *Server) canAdoptLink(link netlink.Link) bool {
+	if link.Type() != "wireguard" {
+		return false
+	}
+	addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
+	if err != nil {
+		return false
+	}
+	want := prefixToIPNet(srv.WgCidr)
+	wantOnes, _ := want.Mask.Size()
+	for _, addr := range addrs {
+		if addr.IPNet == nil {
+			continue
+		}
+		ones, _ := addr.Mask.Size()
+		if addr.IP.Equal(want.IP) && ones == wantOnes {
+			return true
+		}
+	}
+	return false
+}
+
+// restoredPeers holds the result of rebuilding in-memory peer state from a
+// kernel WireGuard device dump.
+type restoredPeers struct {
+	// peerIPs maps each valid peer to its assigned IP.
+	peerIPs map[wgtypes.Key]netip.Addr
+	// invalid lists peers whose AllowedIPs don't encode a valid assigned IP;
+	// they should be removed from the device.
+	invalid []wgtypes.Key
+}
+
+// restorePeerState rebuilds peer-to-IP assignments from a kernel WireGuard
+// peer list, claiming each assigned IP in the allocator. A peer is valid if
+// its first AllowedIP is an IPv4 /32 whose address can be claimed (inside the
+// allocator's prefix and not already taken). Invalid peers are returned for
+// removal so in-memory state and the kernel device stay consistent.
+func restorePeerState(peers []wgtypes.Peer, alloc *IpAllocator) restoredPeers {
+	result := restoredPeers{peerIPs: make(map[wgtypes.Key]netip.Addr)}
+	for _, peer := range peers {
+		addr, ok := peerAssignedIp(peer)
+		if !ok || !alloc.Claim(addr) {
+			result.invalid = append(result.invalid, peer.PublicKey)
+			continue
+		}
+		result.peerIPs[peer.PublicKey] = addr
+	}
+	return result
+}
+
+// peerAssignedIp extracts the IP assigned to a peer from its AllowedIPs,
+// which vprox always writes as a single IPv4 /32.
+func peerAssignedIp(peer wgtypes.Peer) (netip.Addr, bool) {
+	if len(peer.AllowedIPs) == 0 {
+		return netip.Addr{}, false
+	}
+	ipnet := peer.AllowedIPs[0]
+	ipv4 := ipnet.IP.To4()
+	if ipv4 == nil {
+		return netip.Addr{}, false
+	}
+	if ones, bits := ipnet.Mask.Size(); ones != 32 || bits != 32 {
+		return netip.Addr{}, false
+	}
+	return netip.AddrFrom4([4]byte(ipv4)), true
+}
+
+// RestorePeersFromKernel rebuilds the in-memory peer index (peerIPs,
+// ipAllocator, newPeers) from the kernel WireGuard device's peer list. It is
+// called once on startup, after StartWireguard adopts an interface that
+// survived a restart, so that:
+//
+//   - existing peers keep their IPs and the allocator never hands an
+//     already-assigned IP to a new peer (which would silently steal the
+//     existing peer's AllowedIPs routing and blackhole it), and
+//   - the idle reaper grants restored peers the usual grace period instead of
+//     instantly reaping ones whose last handshake predates the restart.
+func (srv *Server) RestorePeersFromKernel() error {
+	device, err := srv.WgClient.Device(srv.Ifname())
+	if err != nil {
+		return fmt.Errorf("failed to get WireGuard device: %v", err)
+	}
+	if len(device.Peers) == 0 {
+		return nil
+	}
+
+	restored := restorePeerState(device.Peers, srv.ipAllocator)
+
+	now := time.Now()
+	srv.mu.Lock()
+	for key, addr := range restored.peerIPs {
+		srv.peerIPs[key] = addr
+		srv.newPeers[key] = now
+	}
+	srv.mu.Unlock()
+
+	if len(restored.peerIPs) > 0 {
+		log.Printf("[%v] restored %d peer(s) from existing WireGuard device",
+			srv.BindAddr, len(restored.peerIPs))
+	}
+
+	// Remove peers with missing or malformed AllowedIPs from the device.
+	// These shouldn't exist, but dropping them keeps in-memory state
+	// consistent with the kernel.
+	if len(restored.invalid) > 0 {
+		removals := make([]wgtypes.PeerConfig, 0, len(restored.invalid))
+		for _, key := range restored.invalid {
+			log.Printf("[%v] removing peer with invalid allowed IPs during restore: %v",
+				srv.BindAddr, key)
+			removals = append(removals, wgtypes.PeerConfig{PublicKey: key, Remove: true})
+		}
+		err := srv.WgClient.ConfigureDevice(srv.Ifname(), wgtypes.Config{Peers: removals})
+		if err != nil {
+			return fmt.Errorf("failed to remove invalid peers: %v", err)
+		}
+	}
 	return nil
 }
 
@@ -322,6 +481,97 @@ func (srv *Server) iptablesSnatRule(enabled bool) error {
 	} else {
 		return srv.Ipt.Delete("nat", "POSTROUTING", rule...)
 	}
+}
+
+// internalSnatRuleComment tags the nat POSTROUTING rule that SNATs traffic
+// from the WireGuard subnet to the internal network.
+const internalSnatRuleComment = "SNAT for WireGuard to internal network"
+
+// staleInternalSnatRules returns the rule specs (the arguments after
+// "-A POSTROUTING") of internal-network SNAT rules for wgCidr whose SNAT
+// target is not bindAddr. rules is an `iptables -S` listing of nat
+// POSTROUTING. Such rules survive a restart when a server index is reused
+// with a different bind address; since AppendUnique adds the new rule after
+// them, they would keep matching internal traffic and SNAT it to the stale
+// address.
+func staleInternalSnatRules(rules []string, wgCidr netip.Prefix, bindAddr netip.Addr) [][]string {
+	// iptables normalizes the source to the masked network address.
+	source := fmt.Sprintf("-s %s ", wgCidr.Masked().String())
+	target := fmt.Sprintf("--to-source %s ", bindAddr.String())
+	var specs [][]string
+	for _, rule := range rules {
+		padded := rule + " "
+		if strings.Contains(padded, internalSnatRuleComment) &&
+			strings.Contains(padded, source) &&
+			!strings.Contains(padded, target) {
+			if spec := iptablesRuleSpec(rule); spec != nil {
+				specs = append(specs, spec)
+			}
+		}
+	}
+	return specs
+}
+
+// iptablesRuleSpec parses an `iptables -S` "-A <chain> ..." line into the
+// rule's argument list (without the leading "-A <chain>"), suitable for a
+// match-based delete. Double-quoted tokens (e.g. comments containing spaces)
+// are unquoted and backslash escapes are resolved. Returns nil for lines that
+// are not append rules, such as the "-P <chain> <policy>" line.
+func iptablesRuleSpec(rule string) []string {
+	var args []string
+	var cur strings.Builder
+	inQuotes := false
+	escaped := false
+	inToken := false
+	for _, r := range rule {
+		switch {
+		case escaped:
+			cur.WriteRune(r)
+			escaped = false
+		case r == '\\':
+			escaped = true
+		case r == '"':
+			inQuotes = !inQuotes
+			inToken = true
+		case r == ' ' && !inQuotes:
+			if inToken {
+				args = append(args, cur.String())
+				cur.Reset()
+				inToken = false
+			}
+		default:
+			cur.WriteRune(r)
+			inToken = true
+		}
+	}
+	if inToken {
+		args = append(args, cur.String())
+	}
+	if len(args) < 2 || args[0] != "-A" {
+		return nil
+	}
+	return args[2:]
+}
+
+// cleanupStaleInternalSnatRules removes internal-network SNAT rules for this
+// server's WireGuard subnet that target a different bind address. Deletion is
+// by exact rule match rather than by rule number: each server runs
+// StartIptables in its own goroutine against the shared iptables handle, so
+// deleting by number races with concurrent inserts/deletes shifting the
+// numbering. Match-based deletes are unaffected, and rules for other servers'
+// subnets never match this server's specs.
+func (srv *Server) cleanupStaleInternalSnatRules() error {
+	rules, err := srv.Ipt.List("nat", "POSTROUTING")
+	if err != nil {
+		return fmt.Errorf("failed to list nat POSTROUTING rules: %v", err)
+	}
+	for _, spec := range staleInternalSnatRules(rules, srv.WgCidr, srv.BindAddr) {
+		log.Printf("[%v] removing stale internal SNAT rule: %v", srv.BindAddr, strings.Join(spec, " "))
+		if err := srv.Ipt.DeleteIfExists("nat", "POSTROUTING", spec...); err != nil {
+			return fmt.Errorf("failed to delete stale SNAT rule: %v", err)
+		}
+	}
+	return nil
 }
 
 func (srv *Server) StartIptables() error {
@@ -373,12 +623,21 @@ func (srv *Server) StartIptables() error {
 	// SNAT rule for internal network traffic. This is currently only applicable for boxes in
 	// the US.
 	if srv.Region == "us-west" {
+		// Shutdown intentionally leaves iptables rules in place (see
+		// ServerManager.Start), so if this server's index was previously
+		// bound to a different address, a stale SNAT rule targeting the old
+		// address would precede the one added below and keep matching
+		// internal traffic. Remove any such rules first.
+		if err := srv.cleanupStaleInternalSnatRules(); err != nil {
+			return err
+		}
+
 		rule = []string{
 			"-s", srv.WgCidr.String(),
 			"-d", srv.InternalNetworkCidr,
 			"-o", srv.InternalBindIface.Attrs().Name,
 			"-j", "SNAT", "--to-source", srv.BindAddr.String(),
-			"-m", "comment", "--comment", "SNAT for WireGuard to internal network",
+			"-m", "comment", "--comment", internalSnatRuleComment,
 		}
 		if err := srv.Ipt.AppendUnique("nat", "POSTROUTING", rule...); err != nil {
 			return fmt.Errorf("failed to add SNAT rule: %v", err)
