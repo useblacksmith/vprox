@@ -108,10 +108,15 @@ type Server struct {
 	// removed when the reaper deletes an idle peer.
 	peerIPs map[wgtypes.Key]netip.Addr
 
-	// ipipMu protects ipipPeers. It is separate from mu so that the IPIP
-	// peer bookkeeping does not contend with the WireGuard peer state.
+	// ipipMu protects ipipPeers and ipipClosed. It is separate from mu so
+	// that the IPIP peer bookkeeping does not contend with the WireGuard
+	// peer state.
 	ipipMu    sync.Mutex
 	ipipPeers map[netip.Addr]*ipipPeer
+	// ipipClosed is set by CleanupIpip so that a /connect-ipip handler
+	// that outlives the shutdown drain cannot register a new tunnel after
+	// cleanup has already run.
+	ipipClosed bool
 }
 
 // InitState initializes the private server state.
@@ -974,7 +979,14 @@ func (srv *Server) ListenForHttps() error {
 	select {
 	case <-srv.Ctx.Done():
 		log.Printf("server no longer listening on %v:443\n", srv.BindAddr)
-		return httpServer.Shutdown(srv.Ctx)
+		// srv.Ctx is already cancelled here, so passing it to Shutdown
+		// would return immediately without draining in-flight handlers.
+		// Drain with a fresh deadline so handlers (notably /connect-ipip,
+		// whose tunnels are torn down right after this function returns)
+		// finish before cleanup runs.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return httpServer.Shutdown(shutdownCtx)
 	case err = <-errCh:
 		return err
 	}

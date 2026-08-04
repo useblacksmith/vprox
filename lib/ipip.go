@@ -189,8 +189,17 @@ func (srv *Server) connectIpipHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Another request from the same client IP could have raced us. If so,
 	// drop the one we just built and reuse the winner so we don't leak an
-	// allocation or an interface.
+	// allocation or an interface. Likewise, if CleanupIpip already ran
+	// (this handler outlived the shutdown drain), registering the peer now
+	// would leak a tunnel that nothing will ever tear down.
 	srv.ipipMu.Lock()
+	if srv.ipipClosed {
+		srv.ipipMu.Unlock()
+		srv.tearDownIpipLink(ifname, peerIP)
+		srv.ipAllocator.Free(peerIP)
+		http.Error(w, "server shutting down", http.StatusServiceUnavailable)
+		return
+	}
 	if winner, ok := srv.ipipPeers[clientIP]; ok {
 		winner.lastSeen = time.Now()
 		srv.ipipMu.Unlock()
@@ -468,6 +477,7 @@ func (srv *Server) removeIdleIpipPeers() {
 // safe to call multiple times.
 func (srv *Server) CleanupIpip() {
 	srv.ipipMu.Lock()
+	srv.ipipClosed = true
 	peers := make([]*ipipPeer, 0, len(srv.ipipPeers))
 	for _, p := range srv.ipipPeers {
 		peers = append(peers, p)
