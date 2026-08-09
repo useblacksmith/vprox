@@ -68,6 +68,29 @@ func TestIpipIfnameRejectsOversizedNames(t *testing.T) {
 	assert.Error(t, err, "expected error for ifname exceeding IFNAMSIZ")
 }
 
+// TestIpipPeerFromIfname verifies the ifname parser used by the startup
+// sweep round-trips with ipipIfname and rejects names that don't belong to
+// this server's IPIP interfaces.
+func TestIpipPeerFromIfname(t *testing.T) {
+	srv := &Server{Index: 7, WgCidr: testWgCidr("10.100.0.0/16")}
+	for _, peer := range []netip.Addr{
+		netip.AddrFrom4([4]byte{10, 100, 0, 2}),
+		netip.AddrFrom4([4]byte{10, 100, 1, 3}),
+		netip.AddrFrom4([4]byte{10, 100, 255, 255}),
+	} {
+		name, err := srv.ipipIfname(peer)
+		require.NoError(t, err)
+		got, ok := srv.ipipPeerFromIfname(name)
+		require.True(t, ok, "expected %s to parse", name)
+		assert.Equal(t, peer, got)
+	}
+
+	for _, name := range []string{"vp8-1", "eth0", "vp7-", "vp7-x", "vproxy7"} {
+		_, ok := srv.ipipPeerFromIfname(name)
+		assert.False(t, ok, "expected %s to be rejected", name)
+	}
+}
+
 func TestIpipIfaceWildcard(t *testing.T) {
 	assert.Equal(t, "vp0-+", (&Server{Index: 0}).ipipIfaceWildcard())
 	assert.Equal(t, "vp42-+", (&Server{Index: 42}).ipipIfaceWildcard())

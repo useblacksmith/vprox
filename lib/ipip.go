@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/vishvananda/netlink"
@@ -74,6 +76,58 @@ func (srv *Server) ipipIfname(peerIP netip.Addr) (string, error) {
 // IPIP interface created for this server.
 func (srv *Server) ipipIfaceWildcard() string {
 	return fmt.Sprintf("vp%d-+", srv.Index)
+}
+
+// ipipPeerFromIfname is the inverse of ipipIfname: it recovers the peer's
+// inner IP from a "vp<srv.Index>-<offset>" interface name. The startup sweep
+// uses it to remove the per-peer iptables rules of tunnels left over from a
+// previous process. Returns false if the name does not belong to this
+// server's IPIP interfaces.
+func (srv *Server) ipipPeerFromIfname(ifname string) (netip.Addr, bool) {
+	suffix, found := strings.CutPrefix(ifname, fmt.Sprintf("vp%d-", srv.Index))
+	if !found {
+		return netip.Addr{}, false
+	}
+	offset, err := strconv.ParseUint(suffix, 10, 32)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	base := srv.WgCidr.Addr().As4()
+	baseInt := uint32(base[0])<<24 | uint32(base[1])<<16 |
+		uint32(base[2])<<8 | uint32(base[3])
+	peerInt := baseInt + uint32(offset)
+	return netip.AddrFrom4([4]byte{
+		byte(peerInt >> 24), byte(peerInt >> 16),
+		byte(peerInt >> 8), byte(peerInt),
+	}), true
+}
+
+// SweepStaleIpip removes IPIP interfaces (and their per-peer iptables rules)
+// left over from a previous process. CleanupIpip only runs on a clean
+// shutdown; after a crash or SIGKILL the interfaces survive while the new
+// process starts with an empty allocator, so a leftover /32 host route could
+// blackhole an IP the allocator later hands to a new WireGuard or IPIP peer.
+// There is no adopt-on-restart path for IPIP (unlike WireGuard), so any
+// surviving vp<srv.Index>-* tunnel is stale by definition.
+func (srv *Server) SweepStaleIpip() error {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return fmt.Errorf("list links for ipip sweep: %v", err)
+	}
+	for _, link := range links {
+		ifname := link.Attrs().Name
+		peerIP, ok := srv.ipipPeerFromIfname(ifname)
+		if !ok {
+			continue
+		}
+		if _, isIptun := link.(*netlink.Iptun); !isIptun {
+			continue
+		}
+		log.Printf("[%v] sweeping stale ipip tunnel %s (peer %v)",
+			srv.BindAddr, ifname, peerIP)
+		srv.tearDownIpipLink(ifname, peerIP)
+	}
+	return nil
 }
 
 // connectIpipHandler handles POST /connect-ipip.
@@ -158,6 +212,25 @@ func (srv *Server) connectIpipHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Serialize tunnel creation. The kernel permits only one IPIP tunnel
+	// per (local, remote) pair, so two parallel first-time requests from
+	// the same client IP would race: both miss the peer map, both
+	// allocate, and the loser's LinkAdd fails with EEXIST even though a
+	// working tunnel exists. Holding the create lock across
+	// allocate+create+insert lets the second request observe the winner's
+	// entry below instead of colliding in the kernel.
+	srv.ipipCreateMu.Lock()
+	defer srv.ipipCreateMu.Unlock()
+
+	srv.ipipMu.Lock()
+	if winner, ok := srv.ipipPeers[clientIP]; ok {
+		winner.lastSeen = time.Now()
+		srv.ipipMu.Unlock()
+		writeIpipResponse(w, fmt.Sprintf("%v/%d", winner.peerIP, srv.WgCidr.Bits()))
+		return
+	}
+	srv.ipipMu.Unlock()
+
 	peerIP := srv.ipAllocator.Allocate()
 	if peerIP.IsUnspecified() {
 		log.Printf("no more ip addresses available in %v", srv.WgCidr)
@@ -187,11 +260,13 @@ func (srv *Server) connectIpipHandler(w http.ResponseWriter, r *http.Request) {
 		lastSeen: time.Now(),
 	}
 
-	// Another request from the same client IP could have raced us. If so,
-	// drop the one we just built and reuse the winner so we don't leak an
-	// allocation or an interface. Likewise, if CleanupIpip already ran
-	// (this handler outlived the shutdown drain), registering the peer now
-	// would leak a tunnel that nothing will ever tear down.
+	// Belt-and-braces: creation is serialized by ipipCreateMu, so no other
+	// request should have inserted an entry for this client IP since the
+	// re-check above, but if one somehow did, drop the tunnel we just
+	// built and reuse the winner so we don't leak an allocation or an
+	// interface. Likewise, if CleanupIpip already ran (this handler
+	// outlived the shutdown drain), registering the peer now would leak a
+	// tunnel that nothing will ever tear down.
 	srv.ipipMu.Lock()
 	if srv.ipipClosed {
 		srv.ipipMu.Unlock()

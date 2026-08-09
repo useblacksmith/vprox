@@ -117,6 +117,12 @@ type Server struct {
 	// that outlives the shutdown drain cannot register a new tunnel after
 	// cleanup has already run.
 	ipipClosed bool
+	// ipipCreateMu serializes the /connect-ipip create path. The kernel
+	// allows only one IPIP tunnel per (local, remote) pair, so two
+	// parallel requests from the same client would both miss the peer
+	// map and the loser's LinkAdd would fail with EEXIST; serializing
+	// creation lets the second request reuse the winner's tunnel.
+	ipipCreateMu sync.Mutex
 }
 
 // InitState initializes the private server state.
