@@ -212,13 +212,29 @@ func (srv *Server) connectIpipHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Serialize tunnel creation. The kernel permits only one IPIP tunnel
-	// per (local, remote) pair, so two parallel first-time requests from
-	// the same client IP would race: both miss the peer map, both
-	// allocate, and the loser's LinkAdd fails with EEXIST even though a
-	// working tunnel exists. Holding the create lock across
-	// allocate+create+insert lets the second request observe the winner's
-	// entry below instead of colliding in the kernel.
+	assigned, errMsg, errStatus := srv.createIpipPeer(clientIP)
+	if errMsg != "" {
+		http.Error(w, errMsg, errStatus)
+		return
+	}
+	writeIpipResponse(w, assigned)
+}
+
+// createIpipPeer allocates an inner IP for clientIP, creates the IPIP
+// tunnel, and registers the peer. On success it returns the assigned inner
+// address in CIDR notation; on failure it returns a non-empty errMsg and
+// the HTTP status to report. Writing the response is left to the caller so
+// ipipCreateMu is released before any client I/O: a slow client read must
+// not stall every other /connect-ipip create.
+//
+// Tunnel creation is serialized by ipipCreateMu. The kernel permits only
+// one IPIP tunnel per (local, remote) pair, so two parallel first-time
+// requests from the same client IP would race: both miss the peer map, both
+// allocate, and the loser's LinkAdd fails with EEXIST even though a working
+// tunnel exists. Holding the create lock across allocate+create+insert lets
+// the second request observe the winner's entry below instead of colliding
+// in the kernel.
+func (srv *Server) createIpipPeer(clientIP netip.Addr) (assigned, errMsg string, errStatus int) {
 	srv.ipipCreateMu.Lock()
 	defer srv.ipipCreateMu.Unlock()
 
@@ -226,31 +242,27 @@ func (srv *Server) connectIpipHandler(w http.ResponseWriter, r *http.Request) {
 	if winner, ok := srv.ipipPeers[clientIP]; ok {
 		winner.lastSeen = time.Now()
 		srv.ipipMu.Unlock()
-		writeIpipResponse(w, fmt.Sprintf("%v/%d", winner.peerIP, srv.WgCidr.Bits()))
-		return
+		return fmt.Sprintf("%v/%d", winner.peerIP, srv.WgCidr.Bits()), "", 0
 	}
 	srv.ipipMu.Unlock()
 
 	peerIP := srv.ipAllocator.Allocate()
 	if peerIP.IsUnspecified() {
 		log.Printf("no more ip addresses available in %v", srv.WgCidr)
-		http.Error(w, "no more IP addresses available", http.StatusServiceUnavailable)
-		return
+		return "", "no more IP addresses available", http.StatusServiceUnavailable
 	}
 
 	ifname, err := srv.ipipIfname(peerIP)
 	if err != nil {
 		srv.ipAllocator.Free(peerIP)
 		log.Printf("[%v] %v", srv.BindAddr, err)
-		http.Error(w, "ipip ifname out of range", http.StatusInternalServerError)
-		return
+		return "", "ipip ifname out of range", http.StatusInternalServerError
 	}
 	if err := srv.createIpipLink(ifname, clientIP, peerIP); err != nil {
 		srv.ipAllocator.Free(peerIP)
 		log.Printf("[%v] failed to create IPIP tunnel for %v: %v",
 			srv.BindAddr, clientIP, err)
-		http.Error(w, "failed to create IPIP tunnel", http.StatusInternalServerError)
-		return
+		return "", "failed to create IPIP tunnel", http.StatusInternalServerError
 	}
 
 	peer := &ipipPeer{
@@ -272,16 +284,14 @@ func (srv *Server) connectIpipHandler(w http.ResponseWriter, r *http.Request) {
 		srv.ipipMu.Unlock()
 		srv.tearDownIpipLink(ifname, peerIP)
 		srv.ipAllocator.Free(peerIP)
-		http.Error(w, "server shutting down", http.StatusServiceUnavailable)
-		return
+		return "", "server shutting down", http.StatusServiceUnavailable
 	}
 	if winner, ok := srv.ipipPeers[clientIP]; ok {
 		winner.lastSeen = time.Now()
 		srv.ipipMu.Unlock()
 		srv.tearDownIpipLink(ifname, peerIP)
 		srv.ipAllocator.Free(peerIP)
-		writeIpipResponse(w, fmt.Sprintf("%v/%d", winner.peerIP, srv.WgCidr.Bits()))
-		return
+		return fmt.Sprintf("%v/%d", winner.peerIP, srv.WgCidr.Bits()), "", 0
 	}
 	srv.ipipPeers[clientIP] = peer
 	srv.ipipMu.Unlock()
@@ -289,7 +299,7 @@ func (srv *Server) connectIpipHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[%v] new ipip peer %v at %v (iface %s)",
 		srv.BindAddr, clientIP, peerIP, ifname)
 
-	writeIpipResponse(w, fmt.Sprintf("%v/%d", peerIP, srv.WgCidr.Bits()))
+	return fmt.Sprintf("%v/%d", peerIP, srv.WgCidr.Bits()), "", 0
 }
 
 func writeIpipResponse(w http.ResponseWriter, assigned string) {
