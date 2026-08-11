@@ -852,17 +852,29 @@ func (srv *Server) addBindAddrLoop() {
 			return
 		case <-time.After(45 * time.Second):
 		}
-		_ = srv.addBindAddr()
+		if err := srv.addBindAddr(); err != nil {
+			log.Printf("[%v] failed to reassert bind address: %v", srv.BindAddr, err)
+		}
 	}
 }
 
+// addBindAddr installs the bind address on the host's network interface as a
+// permanent address.
+//
+// Upstream set a 60-second lifetime here so that a stale claim would expire
+// on its own if the IP was floated to another host (AWS secondary-IP
+// failover). In our deployment each gateway is the sole, permanent owner of
+// its bind address, so there is nothing to hand off — and an expiring address
+// is actively harmful: if this process stalls long enough to miss a refresh
+// (e.g. under heavy tenant churn), the kernel removes the address and flushes
+// every route that depends on it. On Hetzner's DHCP /32 topology that
+// includes the IPv4 default route, which takes the entire gateway offline.
+// The 45-second loop is kept as an idempotent reconciler in case another
+// agent (e.g. systemd-networkd) removes or rewrites the address.
 func (srv *Server) addBindAddr() error {
-	// Add the bind address to the host's network interface.
 	ipnet := prefixToIPNet(netip.PrefixFrom(srv.BindAddr, 32))
 	return netlink.AddrReplace(srv.BindIface, &netlink.Addr{
-		IPNet:       &ipnet,
-		ValidLft:    60, // expiry time in seconds
-		PreferedLft: 60, // expiry time in seconds
+		IPNet: &ipnet,
 	})
 }
 
