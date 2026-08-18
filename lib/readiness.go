@@ -31,9 +31,8 @@ const (
 	ReadinessStale     ReadinessStatus = "stale"
 )
 
-// ReadinessReason is a stable, low-cardinality explanation for an unhealthy
-// readiness check. Detailed errors are logged locally instead of being sent in
-// heartbeats.
+// ReadinessReason is a stable, low-cardinality explanation for a readiness
+// transition. Detailed errors are logged locally.
 type ReadinessReason string
 
 const (
@@ -51,15 +50,19 @@ const (
 	ReadinessReasonServerSetupFailed     ReadinessReason = "server_setup_failed"
 )
 
-// ReadinessSnapshot is the cached result exposed by the backend heartbeat. It
-// deliberately contains no raw system error strings.
+// ReadinessSnapshot is the cached result of the local readiness checks.
 type ReadinessSnapshot struct {
-	Status              ReadinessStatus `json:"status"`
-	Reason              ReadinessReason `json:"reason,omitempty"`
-	CheckedAt           *time.Time      `json:"checked_at,omitempty"`
-	LastSuccessAt       *time.Time      `json:"last_success_at,omitempty"`
-	CheckDurationMillis int64           `json:"check_duration_ms,omitempty"`
-	ConsecutiveFailures int             `json:"consecutive_failures"`
+	Status              ReadinessStatus
+	Reason              ReadinessReason
+	CheckedAt           *time.Time
+	LastSuccessAt       *time.Time
+	CheckDurationMillis int64
+	ConsecutiveFailures int
+}
+
+// RoutingEligible reports whether the server should receive new connections.
+func (snapshot ReadinessSnapshot) RoutingEligible() bool {
+	return snapshot.Status == ReadinessHealthy || snapshot.Status == ReadinessDegraded
 }
 
 type readinessTracker struct {

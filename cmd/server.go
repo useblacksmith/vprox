@@ -149,8 +149,8 @@ func runServer(cmd *cobra.Command, args []string) error {
 		serverIPs = append(serverIPs, ip)
 	}
 
-	// Report liveness and cached readiness independently for every configured
-	// bind IP. Heartbeats continue even when a server is unhealthy.
+	// Report liveness and routing health independently for every configured bind
+	// IP. Heartbeats continue even when a server is unhealthy.
 	livenessReporters := make([]*LivenessReporter, 0, len(serverIPs))
 	for _, ip := range serverIPs {
 		ip := ip
@@ -168,8 +168,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	sm.Wait()
 
 	// A setup or listener failure can stop the last server before its next
-	// periodic heartbeat. Send the terminal cached state once before exiting so
-	// the backend still receives the classified failure.
+	// periodic heartbeat. Send the terminal health state once before exiting.
 	if ctx.Err() == nil {
 		for _, reporter := range livenessReporters {
 			reporter.Report(ctx)

@@ -18,9 +18,11 @@ func TestReadinessTrackerHysteresis(t *testing.T) {
 
 	initial := tracker.get(start)
 	assert.Equal(t, ReadinessStarting, initial.Status)
+	assert.False(t, initial.RoutingEligible())
 
 	healthy := tracker.recordSuccess(start.Add(time.Second), 20*time.Millisecond)
 	assert.Equal(t, ReadinessHealthy, healthy.Status)
+	assert.True(t, healthy.RoutingEligible())
 
 	for failure := 1; failure <= readinessFailureLimit; failure++ {
 		snapshot := tracker.recordFailure(
@@ -31,14 +33,17 @@ func TestReadinessTrackerHysteresis(t *testing.T) {
 		assert.Equal(t, failure, snapshot.ConsecutiveFailures)
 		if failure < readinessFailureLimit {
 			assert.Equal(t, ReadinessDegraded, snapshot.Status)
+			assert.True(t, snapshot.RoutingEligible())
 		} else {
 			assert.Equal(t, ReadinessUnhealthy, snapshot.Status)
+			assert.False(t, snapshot.RoutingEligible())
 		}
 	}
 
 	recovering := tracker.recordSuccess(start.Add(10*time.Second), 5*time.Millisecond)
 	assert.Equal(t, ReadinessUnhealthy, recovering.Status)
 	assert.Equal(t, ReadinessReasonRecovering, recovering.Reason)
+	assert.False(t, recovering.RoutingEligible())
 
 	failedRecovery := tracker.recordFailure(
 		start.Add(11*time.Second),
@@ -52,6 +57,7 @@ func TestReadinessTrackerHysteresis(t *testing.T) {
 	recovered := tracker.recordSuccess(start.Add(13*time.Second), 5*time.Millisecond)
 	assert.Equal(t, ReadinessHealthy, recovered.Status)
 	assert.Empty(t, recovered.Reason)
+	assert.True(t, recovered.RoutingEligible())
 }
 
 func TestReadinessDoesNotAdvertiseBeforeFirstSuccess(t *testing.T) {
@@ -79,6 +85,7 @@ func TestReadinessBecomesStale(t *testing.T) {
 	snapshot := tracker.get(checkedAt.Add(readinessStaleAfter + time.Second))
 	assert.Equal(t, ReadinessStale, snapshot.Status)
 	assert.Equal(t, ReadinessReasonCheckStale, snapshot.Reason)
+	assert.False(t, snapshot.RoutingEligible())
 
 	firstSuccess := tracker.recordSuccess(checkedAt.Add(readinessStaleAfter+2*time.Second), time.Millisecond)
 	assert.Equal(t, ReadinessUnhealthy, firstSuccess.Status)

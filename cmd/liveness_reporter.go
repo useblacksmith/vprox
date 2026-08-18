@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/rand"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/modal-labs/vprox/lib"
@@ -19,20 +21,29 @@ type LivenessReporter struct {
 	ip                string
 	region            string
 	readinessProvider func() lib.ReadinessSnapshot
+	healthLogMu       sync.Mutex
+	loggedFailure     lib.ReadinessReason
 }
 
 func (r *LivenessReporter) Report(ctx context.Context) {
-	requestBody := struct {
-		IP        string                 `json:"ip"`
-		Region    string                 `json:"region"`
-		Readiness *lib.ReadinessSnapshot `json:"readiness,omitempty"`
-	}{
-		IP:     r.ip,
-		Region: r.region,
+	readiness := lib.ReadinessSnapshot{
+		Status: lib.ReadinessStarting,
+		Reason: lib.ReadinessReasonStarting,
 	}
 	if r.readinessProvider != nil {
-		readiness := r.readinessProvider()
-		requestBody.Readiness = &readiness
+		readiness = r.readinessProvider()
+	}
+	healthy := readiness.RoutingEligible()
+	r.logFailure(readiness, healthy)
+
+	requestBody := struct {
+		IP      string `json:"ip"`
+		Region  string `json:"region"`
+		Healthy bool   `json:"healthy"`
+	}{
+		IP:      r.ip,
+		Region:  r.region,
+		Healthy: healthy,
 	}
 	jsonBody, err := json.Marshal(requestBody)
 	if err != nil {
@@ -61,6 +72,22 @@ func (r *LivenessReporter) Report(ctx context.Context) {
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		fmt.Printf("error reporting liveness: unexpected status code: %d\n", resp.StatusCode)
 	}
+}
+
+func (r *LivenessReporter) logFailure(readiness lib.ReadinessSnapshot, healthy bool) {
+	r.healthLogMu.Lock()
+	defer r.healthLogMu.Unlock()
+
+	if healthy {
+		r.loggedFailure = ""
+		return
+	}
+	if readiness.Reason == r.loggedFailure {
+		return
+	}
+
+	log.Printf("[%s] static IP is unhealthy (%s)", r.ip, readiness.Reason)
+	r.loggedFailure = readiness.Reason
 }
 
 const (

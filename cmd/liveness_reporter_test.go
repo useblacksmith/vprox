@@ -10,7 +10,6 @@ import (
 
 	"github.com/modal-labs/vprox/lib"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 type capturedLivenessRequest struct {
@@ -20,7 +19,7 @@ type capturedLivenessRequest struct {
 	body          map[string]any
 }
 
-func TestLivenessReporterIncludesReadiness(t *testing.T) {
+func TestLivenessReporterReportsHealth(t *testing.T) {
 	received := make(chan capturedLivenessRequest, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
@@ -57,10 +56,6 @@ func TestLivenessReporterIncludesReadiness(t *testing.T) {
 	assert.Equal(t, "Bearer admin-token", request.authorization)
 	assert.Equal(t, "192.0.2.10", request.body["ip"])
 	assert.Equal(t, "test-region", request.body["region"])
-
-	readiness, ok := request.body["readiness"].(map[string]any)
-	require.True(t, ok)
-	assert.Equal(t, "unhealthy", readiness["status"])
-	assert.Equal(t, "default_route_invalid", readiness["reason"])
-	assert.Equal(t, float64(3), readiness["consecutive_failures"])
+	assert.Equal(t, false, request.body["healthy"])
+	assert.NotContains(t, request.body, "readiness")
 }
