@@ -853,8 +853,6 @@ func (srv *Server) ListenForHttps() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.indexHandler)
 	mux.HandleFunc("/connect", srv.connectHandler)
-	mux.HandleFunc("/health/live", srv.healthLiveHandler)
-	mux.HandleFunc("/health/ready", srv.healthReadyHandler)
 
 	cert, err := loadServerTls()
 	if err != nil {

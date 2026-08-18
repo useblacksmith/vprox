@@ -1,11 +1,9 @@
 package lib
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -53,8 +51,8 @@ const (
 	ReadinessReasonServerSetupFailed     ReadinessReason = "server_setup_failed"
 )
 
-// ReadinessSnapshot is the cached result exposed by the health endpoint and
-// backend heartbeat. It deliberately contains no raw system error strings.
+// ReadinessSnapshot is the cached result exposed by the backend heartbeat. It
+// deliberately contains no raw system error strings.
 type ReadinessSnapshot struct {
 	Status              ReadinessStatus `json:"status"`
 	Reason              ReadinessReason `json:"reason,omitempty"`
@@ -62,13 +60,6 @@ type ReadinessSnapshot struct {
 	LastSuccessAt       *time.Time      `json:"last_success_at,omitempty"`
 	CheckDurationMillis int64           `json:"check_duration_ms,omitempty"`
 	ConsecutiveFailures int             `json:"consecutive_failures"`
-}
-
-// Ready reports whether the cached state is eligible to receive new
-// connections. A degraded server remains eligible while hysteresis absorbs a
-// transient failure.
-func (s ReadinessSnapshot) Ready() bool {
-	return s.Status == ReadinessHealthy || s.Status == ReadinessDegraded
 }
 
 type readinessTracker struct {
@@ -441,39 +432,4 @@ func (srv *Server) checkPeerCapacity() error {
 		return fmt.Errorf("WireGuard peer address pool is exhausted")
 	}
 	return nil
-}
-
-func writeHealthJSON(w http.ResponseWriter, statusCode int, body any) {
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(statusCode)
-	if err := json.NewEncoder(w).Encode(body); err != nil {
-		log.Printf("failed to write health response: %v", err)
-	}
-}
-
-func (srv *Server) healthLiveHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", http.MethodGet)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	writeHealthJSON(w, http.StatusOK, struct {
-		Status string `json:"status"`
-	}{Status: "alive"})
-}
-
-func (srv *Server) healthReadyHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", http.MethodGet)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	snapshot := srv.Readiness()
-	statusCode := http.StatusServiceUnavailable
-	if snapshot.Ready() {
-		statusCode = http.StatusOK
-	}
-	writeHealthJSON(w, statusCode, snapshot)
 }

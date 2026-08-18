@@ -1,11 +1,8 @@
 package lib
 
 import (
-	"encoding/json"
 	"errors"
 	"net"
-	"net/http"
-	"net/http/httptest"
 	"net/netip"
 	"testing"
 	"time"
@@ -21,11 +18,9 @@ func TestReadinessTrackerHysteresis(t *testing.T) {
 
 	initial := tracker.get(start)
 	assert.Equal(t, ReadinessStarting, initial.Status)
-	assert.False(t, initial.Ready())
 
 	healthy := tracker.recordSuccess(start.Add(time.Second), 20*time.Millisecond)
 	assert.Equal(t, ReadinessHealthy, healthy.Status)
-	assert.True(t, healthy.Ready())
 
 	for failure := 1; failure <= readinessFailureLimit; failure++ {
 		snapshot := tracker.recordFailure(
@@ -36,17 +31,14 @@ func TestReadinessTrackerHysteresis(t *testing.T) {
 		assert.Equal(t, failure, snapshot.ConsecutiveFailures)
 		if failure < readinessFailureLimit {
 			assert.Equal(t, ReadinessDegraded, snapshot.Status)
-			assert.True(t, snapshot.Ready())
 		} else {
 			assert.Equal(t, ReadinessUnhealthy, snapshot.Status)
-			assert.False(t, snapshot.Ready())
 		}
 	}
 
 	recovering := tracker.recordSuccess(start.Add(10*time.Second), 5*time.Millisecond)
 	assert.Equal(t, ReadinessUnhealthy, recovering.Status)
 	assert.Equal(t, ReadinessReasonRecovering, recovering.Reason)
-	assert.False(t, recovering.Ready())
 
 	failedRecovery := tracker.recordFailure(
 		start.Add(11*time.Second),
@@ -73,7 +65,6 @@ func TestReadinessDoesNotAdvertiseBeforeFirstSuccess(t *testing.T) {
 			ReadinessReasonWireGuardUnavailable,
 		)
 		assert.Equal(t, ReadinessStarting, snapshot.Status)
-		assert.False(t, snapshot.Ready())
 	}
 }
 
@@ -88,12 +79,10 @@ func TestReadinessBecomesStale(t *testing.T) {
 	snapshot := tracker.get(checkedAt.Add(readinessStaleAfter + time.Second))
 	assert.Equal(t, ReadinessStale, snapshot.Status)
 	assert.Equal(t, ReadinessReasonCheckStale, snapshot.Reason)
-	assert.False(t, snapshot.Ready())
 
 	firstSuccess := tracker.recordSuccess(checkedAt.Add(readinessStaleAfter+2*time.Second), time.Millisecond)
 	assert.Equal(t, ReadinessUnhealthy, firstSuccess.Status)
 	assert.Equal(t, ReadinessReasonRecovering, firstSuccess.Reason)
-	assert.False(t, firstSuccess.Ready())
 	assert.Equal(t, ReadinessHealthy,
 		tracker.recordSuccess(checkedAt.Add(readinessStaleAfter+3*time.Second), time.Millisecond).Status)
 }
@@ -119,36 +108,6 @@ func TestRunReadinessChecksStopsAtFirstFailure(t *testing.T) {
 	require.EqualError(t, err, "route missing")
 	assert.Equal(t, ReadinessReasonDefaultRouteInvalid, reason)
 	assert.Equal(t, []string{"listener", "route"}, calls)
-}
-
-func TestHealthHandlersUseCachedReadiness(t *testing.T) {
-	now := time.Now()
-	srv := &Server{}
-	srv.readiness = &serverReadiness{tracker: newReadinessTracker(now, readinessStaleAfter)}
-
-	request := httptest.NewRequest(http.MethodGet, "/health/ready", nil)
-	response := httptest.NewRecorder()
-	srv.healthReadyHandler(response, request)
-	assert.Equal(t, http.StatusServiceUnavailable, response.Code)
-	assert.Equal(t, "no-store", response.Header().Get("Cache-Control"))
-
-	srv.readiness.tracker.recordSuccess(now.Add(time.Second), time.Millisecond)
-	response = httptest.NewRecorder()
-	srv.healthReadyHandler(response, request)
-	assert.Equal(t, http.StatusOK, response.Code)
-
-	var snapshot ReadinessSnapshot
-	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &snapshot))
-	assert.Equal(t, ReadinessHealthy, snapshot.Status)
-
-	response = httptest.NewRecorder()
-	srv.healthLiveHandler(response, httptest.NewRequest(http.MethodGet, "/health/live", nil))
-	assert.Equal(t, http.StatusOK, response.Code)
-	assert.JSONEq(t, `{"status":"alive"}`, response.Body.String())
-
-	response = httptest.NewRecorder()
-	srv.healthReadyHandler(response, httptest.NewRequest(http.MethodPost, "/health/ready", nil))
-	assert.Equal(t, http.StatusMethodNotAllowed, response.Code)
 }
 
 func TestRequiredIptablesRules(t *testing.T) {

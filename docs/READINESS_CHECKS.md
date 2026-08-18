@@ -1,6 +1,6 @@
 # Vprox readiness checks
 
-Vprox reports process liveness separately from the readiness of each configured bind IP. The periodic heartbeat shows that the process is reporting, `/health/live` shows that the HTTPS listener is serving, and readiness shows whether the server's local networking prerequisites are intact and whether it can accept another peer.
+Vprox reports process liveness separately from the readiness of each configured bind IP. The periodic heartbeat shows that the process is reporting, while its cached readiness shows whether the HTTPS listener and local networking prerequisites are intact and whether the server can accept another peer.
 
 ## Local checks
 
@@ -45,22 +45,15 @@ Readiness reasons are stable, low-cardinality values:
 - `readiness_check_stale`
 - `server_setup_failed`
 
-Detailed system errors are written to local logs and are not included in readiness responses or heartbeat payloads.
-
-## Health endpoints
-
-The existing HTTPS listener serves two health routes:
-
-- `GET /health/live` returns `200` with `{"status":"alive"}` while the listener is serving.
-- `GET /health/ready` returns the cached readiness snapshot with no synchronous network inspection or mutation.
-
-`/health/ready` returns `200` for `healthy` and `degraded`, and `503` for `starting`, `unhealthy`, and `stale`. Both successful health responses use `Cache-Control: no-store`.
+Detailed system errors are written to local logs and are not included in heartbeat payloads.
 
 ## Backend heartbeat
 
 The existing `/api/admin/staticip/liveness` heartbeat retains its `ip` and `region` fields and includes a nested `readiness` object for each configured bind IP. Heartbeats continue while a running server is degraded or unhealthy. If setup or the listener fails before the next periodic heartbeat, vprox sends the terminal classified state once before exiting.
 
 The backend request schema must accept the additive `readiness` field. Routing consumers can exclude `starting`, `unhealthy`, and `stale` servers while continuing to route to `healthy` and `degraded` servers.
+
+Vprox does not expose separate liveness or readiness endpoints. Health state is pushed to the backend through this heartbeat.
 
 ## Scope
 
