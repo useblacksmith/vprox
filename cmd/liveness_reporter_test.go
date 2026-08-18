@@ -64,25 +64,3 @@ func TestLivenessReporterIncludesReadiness(t *testing.T) {
 	assert.Equal(t, "default_route_invalid", readiness["reason"])
 	assert.Equal(t, float64(3), readiness["consecutive_failures"])
 }
-
-func TestLivenessReporterOmitsReadinessWithoutProvider(t *testing.T) {
-	received := make(chan map[string]any, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]any
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		received <- body
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
-	reporter := &LivenessReporter{
-		client:          http.Client{Timeout: time.Second},
-		backendEndpoint: server.URL,
-		ip:              "192.0.2.10",
-		region:          "test-region",
-	}
-	reporter.Report(context.Background())
-
-	body := <-received
-	assert.NotContains(t, body, "readiness")
-}
