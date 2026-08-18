@@ -117,16 +117,8 @@ func runServer(cmd *cobra.Command, args []string) error {
 	defer sm.Wait()
 	defer done()
 
-	newLivenessReporter := func(ip netip.Addr, readinessProvider func() lib.ReadinessSnapshot) *LivenessReporter {
-		return &LivenessReporter{
-			client:            http.Client{Timeout: 5 * time.Second},
-			ip:                ip.String(),
-			region:            serverCmdArgs.region,
-			backendEndpoint:   os.Getenv("BACKEND_ENDPOINT"),
-			backendAdminToken: os.Getenv("BACKEND_ADMIN_TOKEN"),
-			readinessProvider: readinessProvider,
-		}
-	}
+	backendEndpoint := os.Getenv("BACKEND_ENDPOINT")
+	backendAdminToken := os.Getenv("BACKEND_ADMIN_TOKEN")
 
 	var serverIPs []netip.Addr
 	for _, ipStr := range serverCmdArgs.ip {
@@ -137,14 +129,21 @@ func runServer(cmd *cobra.Command, args []string) error {
 		err = sm.Start(ip)
 		if err != nil {
 			checkedAt := time.Now()
-			newLivenessReporter(ip, func() lib.ReadinessSnapshot {
-				return lib.ReadinessSnapshot{
-					Status:              lib.ReadinessUnhealthy,
-					Reason:              lib.ReadinessReasonServerSetupFailed,
-					CheckedAt:           &checkedAt,
-					ConsecutiveFailures: 1,
-				}
-			}).Report(ctx)
+			setupFailure := lib.ReadinessSnapshot{
+				Status:              lib.ReadinessUnhealthy,
+				Reason:              lib.ReadinessReasonServerSetupFailed,
+				CheckedAt:           &checkedAt,
+				ConsecutiveFailures: 1,
+			}
+			reporter := &LivenessReporter{
+				client:            http.Client{Timeout: 5 * time.Second},
+				ip:                ip.String(),
+				region:            serverCmdArgs.region,
+				backendEndpoint:   backendEndpoint,
+				backendAdminToken: backendAdminToken,
+				readinessProvider: func() lib.ReadinessSnapshot { return setupFailure },
+			}
+			reporter.Report(ctx)
 			return err
 		}
 		serverIPs = append(serverIPs, ip)
@@ -155,9 +154,14 @@ func runServer(cmd *cobra.Command, args []string) error {
 	livenessReporters := make([]*LivenessReporter, 0, len(serverIPs))
 	for _, ip := range serverIPs {
 		ip := ip
-		livenessReporter := newLivenessReporter(ip, func() lib.ReadinessSnapshot {
-			return sm.Readiness(ip)
-		})
+		livenessReporter := &LivenessReporter{
+			client:            http.Client{Timeout: 5 * time.Second},
+			ip:                ip.String(),
+			region:            serverCmdArgs.region,
+			backendEndpoint:   backendEndpoint,
+			backendAdminToken: backendAdminToken,
+			readinessProvider: func() lib.ReadinessSnapshot { return sm.Readiness(ip) },
+		}
 		livenessReporter.Start(ctx)
 		livenessReporters = append(livenessReporters, livenessReporter)
 	}
