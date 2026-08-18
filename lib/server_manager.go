@@ -16,6 +16,7 @@ import (
 type ServerInfo struct {
 	i      uint16
 	cancel context.CancelFunc
+	server *Server
 }
 
 // ServerManager handles creating and terminating servers on ips
@@ -120,7 +121,7 @@ func (sm *ServerManager) Start(ip netip.Addr) error {
 		InternalNetworkCidr: sm.internalNetworkCidr,
 	}
 	if err := srv.InitState(); err != nil {
-		_ = cancel // cancel should be discarded
+		cancel()
 		sm.freeIndex(i)
 		return err
 	}
@@ -129,6 +130,7 @@ func (sm *ServerManager) Start(ip netip.Addr) error {
 	go func() {
 		defer sm.waitGroup.Done()
 		defer sm.freeIndex(i)
+		defer cancel()
 
 		// Note: we intentionally do NOT clean up the WireGuard interface or
 		// iptables rules on shutdown. The kernel dataplane keeps forwarding
@@ -138,28 +140,44 @@ func (sm *ServerManager) Start(ip netip.Addr) error {
 		// in-memory peer state from it. CleanupWireguard/CleanupIptables
 		// remain available for manual decommissioning.
 		if err := srv.StartWireguard(); err != nil {
+			srv.markReadinessFatal(ReadinessReasonWireGuardUnavailable)
 			log.Printf("[%v] failed to start WireGuard: %v", ip, err)
 			return
 		}
 
 		if err := srv.RestorePeersFromKernel(); err != nil {
+			srv.markReadinessFatal(ReadinessReasonWireGuardUnavailable)
 			log.Printf("[%v] failed to restore peers from kernel: %v", ip, err)
 			return
 		}
 
 		if err := srv.StartIptables(); err != nil {
+			srv.markReadinessFatal(ReadinessReasonIptablesRuleMissing)
 			log.Printf("[%v] failed to start iptables: %v", ip, err)
 			return
 		}
 
 		if err := srv.ListenForHttps(); err != nil {
+			if subctx.Err() != nil {
+				return
+			}
+			srv.markReadinessFatal(ReadinessReasonListenerUnavailable)
 			log.Printf("[%v] https server failed: %v", ip, err)
 			return
 		}
 	}()
 
-	sm.activeServers[ip] = ServerInfo{i, cancel}
+	sm.activeServers[ip] = ServerInfo{i: i, cancel: cancel, server: srv}
 	return nil
+}
+
+// Readiness returns the cached readiness state for the server bound to ip.
+func (sm *ServerManager) Readiness(ip netip.Addr) ReadinessSnapshot {
+	server, ok := sm.activeServers[ip]
+	if !ok {
+		return ReadinessSnapshot{Status: ReadinessStarting, Reason: ReadinessReasonStarting}
+	}
+	return server.server.Readiness()
 }
 
 // Wait blocks until the running servers exit.

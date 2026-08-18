@@ -11,6 +11,12 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+// IPv4's address-family value from the Linux netlink ABI. vishvananda/netlink only
+// exports its named constants on Linux, while its API stubs compile on other
+// platforms; keeping the value here lets platform-independent unit tests
+// compile without changing Linux behavior.
+const netlinkFamilyV4 = 2
+
 // prefixToIPNet converts a netip.Prefix to a net.IPNet.
 func prefixToIPNet(prefix netip.Prefix) net.IPNet {
 	ip := net.IP(prefix.Addr().AsSlice())
@@ -28,7 +34,7 @@ func addrToIp(addr netip.Addr) net.IP {
 
 // getDefaultInterface returns the default network interface.
 func getDefaultInterface() (netlink.Link, error) {
-	routes, err := netlink.RouteList(nil, netlink.FAMILY_ALL)
+	routes, err := netlink.RouteList(nil, netlinkFamilyV4)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list routes: %v", err)
 	}
@@ -78,7 +84,7 @@ func getInternalInterface() (netlink.Link, error) {
 			continue
 		}
 
-		addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
+		addrs, err := netlink.AddrList(link, netlinkFamilyV4)
 		if err != nil {
 			log.Printf("failed to get addresses for interface %s: %v", name, err)
 			continue
@@ -214,6 +220,28 @@ func (ipa *IpAllocator) Free(addr netip.Addr) bool {
 	if _, ok := ipa.allocated[addr]; ok {
 		delete(ipa.allocated, addr)
 		return true
+	}
+	return false
+}
+
+// HasCapacity reports whether Allocate can return another address.
+func (ipa *IpAllocator) HasCapacity() bool {
+	ipa.mu.Lock()
+	defer ipa.mu.Unlock()
+
+	if ipa.prefix.Addr().Is4() {
+		// Allocate skips the prefix's initial address. Every vprox peer pool is
+		// IPv4, so capacity can be checked in constant time.
+		available := (uint64(1) << uint(32-ipa.prefix.Bits())) - 1
+		return uint64(len(ipa.allocated)) < available
+	}
+
+	addr := ipa.prefix.Addr().Next()
+	for ipa.prefix.Contains(addr) && !addr.IsUnspecified() {
+		if _, allocated := ipa.allocated[addr]; !allocated {
+			return true
+		}
+		addr = addr.Next()
 	}
 	return false
 }
