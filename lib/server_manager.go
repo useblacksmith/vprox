@@ -121,7 +121,7 @@ func (sm *ServerManager) Start(ip netip.Addr) error {
 		InternalNetworkCidr: sm.internalNetworkCidr,
 	}
 	if err := srv.InitState(); err != nil {
-		_ = cancel // cancel should be discarded
+		cancel()
 		sm.freeIndex(i)
 		return err
 	}
@@ -130,6 +130,7 @@ func (sm *ServerManager) Start(ip netip.Addr) error {
 	go func() {
 		defer sm.waitGroup.Done()
 		defer sm.freeIndex(i)
+		defer cancel()
 
 		// Note: we intentionally do NOT clean up the WireGuard interface or
 		// iptables rules on shutdown. The kernel dataplane keeps forwarding
