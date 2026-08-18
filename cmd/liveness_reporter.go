@@ -22,7 +22,8 @@ type LivenessReporter struct {
 	region            string
 	readinessProvider func() lib.ReadinessSnapshot
 	healthLogMu       sync.Mutex
-	loggedFailure     lib.ReadinessReason
+	loggedStatus      lib.ReadinessStatus
+	loggedReason      lib.ReadinessReason
 }
 
 func (r *LivenessReporter) Report(ctx context.Context) {
@@ -34,7 +35,7 @@ func (r *LivenessReporter) Report(ctx context.Context) {
 		readiness = r.readinessProvider()
 	}
 	healthy := readiness.RoutingEligible()
-	r.logFailure(readiness, healthy)
+	r.logFailure(readiness)
 
 	requestBody := struct {
 		IP      string `json:"ip"`
@@ -74,20 +75,22 @@ func (r *LivenessReporter) Report(ctx context.Context) {
 	}
 }
 
-func (r *LivenessReporter) logFailure(readiness lib.ReadinessSnapshot, healthy bool) {
+func (r *LivenessReporter) logFailure(readiness lib.ReadinessSnapshot) {
 	r.healthLogMu.Lock()
 	defer r.healthLogMu.Unlock()
 
-	if healthy {
-		r.loggedFailure = ""
+	if readiness.Status != lib.ReadinessUnhealthy && readiness.Status != lib.ReadinessStale {
+		r.loggedStatus = ""
+		r.loggedReason = ""
 		return
 	}
-	if readiness.Reason == r.loggedFailure {
+	if readiness.Status == r.loggedStatus && readiness.Reason == r.loggedReason {
 		return
 	}
 
-	log.Printf("[%s] static IP is unhealthy (%s)", r.ip, readiness.Reason)
-	r.loggedFailure = readiness.Reason
+	log.Printf("[%s] static IP readiness is %s (%s)", r.ip, readiness.Status, readiness.Reason)
+	r.loggedStatus = readiness.Status
+	r.loggedReason = readiness.Reason
 }
 
 const (

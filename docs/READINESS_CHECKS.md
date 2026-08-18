@@ -45,7 +45,7 @@ Readiness reasons are stable, low-cardinality values:
 - `readiness_check_stale`
 - `server_setup_failed`
 
-When a server becomes unhealthy, vprox logs the stable failure reason locally. Readiness check failures also include the detailed system error in local logs. Failure reasons and system errors are not included in heartbeat payloads.
+When a server enters the `unhealthy` or `stale` state, vprox logs the exact status and stable failure reason locally. The expected `starting` state is not logged as a failure. Readiness check failures also include the detailed system error in local logs. Failure reasons and system errors are not included in heartbeat payloads.
 
 ## Backend heartbeat
 
