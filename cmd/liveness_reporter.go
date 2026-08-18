@@ -8,6 +8,8 @@ import (
 	"math/rand"
 	"net/http"
 	"time"
+
+	"github.com/modal-labs/vprox/lib"
 )
 
 type LivenessReporter struct {
@@ -16,15 +18,21 @@ type LivenessReporter struct {
 	backendAdminToken string
 	ip                string
 	region            string
+	readinessProvider func() lib.ReadinessSnapshot
 }
 
 func (r *LivenessReporter) Report(ctx context.Context) {
 	requestBody := struct {
-		IP     string `json:"ip"`
-		Region string `json:"region"`
+		IP        string                 `json:"ip"`
+		Region    string                 `json:"region"`
+		Readiness *lib.ReadinessSnapshot `json:"readiness,omitempty"`
 	}{
 		IP:     r.ip,
 		Region: r.region,
+	}
+	if r.readinessProvider != nil {
+		readiness := r.readinessProvider()
+		requestBody.Readiness = &readiness
 	}
 	jsonBody, err := json.Marshal(requestBody)
 	if err != nil {

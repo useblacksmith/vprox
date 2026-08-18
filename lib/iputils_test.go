@@ -33,6 +33,22 @@ func TestIpAllocatorClaim(t *testing.T) {
 	assert.True(t, ipa.Claim(addr))
 }
 
+func TestIpAllocatorHasCapacity(t *testing.T) {
+	ipa := NewIpAllocator(netip.MustParsePrefix("192.168.0.0/30"))
+	assert.True(t, ipa.HasCapacity())
+
+	first := ipa.Allocate()
+	second := ipa.Allocate()
+	third := ipa.Allocate()
+	assert.Equal(t, netip.MustParseAddr("192.168.0.1"), first)
+	assert.Equal(t, netip.MustParseAddr("192.168.0.2"), second)
+	assert.Equal(t, netip.MustParseAddr("192.168.0.3"), third)
+	assert.False(t, ipa.HasCapacity())
+
+	assert.True(t, ipa.Free(second))
+	assert.True(t, ipa.HasCapacity())
+}
+
 func TestAfterOneIpBlock(t *testing.T) {
 	ip1 := netip.AddrFrom4([4]byte{192, 168, 1, 0})
 	ip2 := netip.AddrFrom4([4]byte{192, 168, 2, 0})

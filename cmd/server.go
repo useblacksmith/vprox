@@ -117,16 +117,18 @@ func runServer(cmd *cobra.Command, args []string) error {
 	defer sm.Wait()
 	defer done()
 
-	// Start the liveness reporter.
-	livenessReporter := &LivenessReporter{
-		client:            http.Client{Timeout: 5 * time.Second},
-		ip:                serverCmdArgs.ip[0],
-		region:            serverCmdArgs.region,
-		backendEndpoint:   os.Getenv("BACKEND_ENDPOINT"),
-		backendAdminToken: os.Getenv("BACKEND_ADMIN_TOKEN"),
+	newLivenessReporter := func(ip netip.Addr, readinessProvider func() lib.ReadinessSnapshot) *LivenessReporter {
+		return &LivenessReporter{
+			client:            http.Client{Timeout: 5 * time.Second},
+			ip:                ip.String(),
+			region:            serverCmdArgs.region,
+			backendEndpoint:   os.Getenv("BACKEND_ENDPOINT"),
+			backendAdminToken: os.Getenv("BACKEND_ADMIN_TOKEN"),
+			readinessProvider: readinessProvider,
+		}
 	}
-	livenessReporter.Start(ctx)
 
+	var serverIPs []netip.Addr
 	for _, ipStr := range serverCmdArgs.ip {
 		ip, err := netip.ParseAddr(ipStr)
 		if err != nil || !ip.Is4() {
@@ -134,10 +136,41 @@ func runServer(cmd *cobra.Command, args []string) error {
 		}
 		err = sm.Start(ip)
 		if err != nil {
+			checkedAt := time.Now()
+			newLivenessReporter(ip, func() lib.ReadinessSnapshot {
+				return lib.ReadinessSnapshot{
+					Status:              lib.ReadinessUnhealthy,
+					Reason:              lib.ReadinessReasonServerSetupFailed,
+					CheckedAt:           &checkedAt,
+					ConsecutiveFailures: 1,
+				}
+			}).Report(ctx)
 			return err
 		}
+		serverIPs = append(serverIPs, ip)
+	}
+
+	// Report liveness and cached readiness independently for every configured
+	// bind IP. Heartbeats continue even when a server is unhealthy.
+	livenessReporters := make([]*LivenessReporter, 0, len(serverIPs))
+	for _, ip := range serverIPs {
+		ip := ip
+		livenessReporter := newLivenessReporter(ip, func() lib.ReadinessSnapshot {
+			return sm.Readiness(ip)
+		})
+		livenessReporter.Start(ctx)
+		livenessReporters = append(livenessReporters, livenessReporter)
 	}
 	sm.Wait()
+
+	// A setup or listener failure can stop the last server before its next
+	// periodic heartbeat. Send the terminal cached state once before exiting so
+	// the backend still receives the classified failure.
+	if ctx.Err() == nil {
+		for _, reporter := range livenessReporters {
+			reporter.Report(ctx)
+		}
+	}
 
 	return nil
 }

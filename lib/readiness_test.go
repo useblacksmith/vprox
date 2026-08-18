@@ -1,0 +1,183 @@
+package lib
+
+import (
+	"encoding/json"
+	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/vishvananda/netlink"
+)
+
+func TestReadinessTrackerHysteresis(t *testing.T) {
+	start := time.Date(2026, time.August, 17, 12, 0, 0, 0, time.UTC)
+	tracker := newReadinessTracker(start, readinessStaleAfter)
+
+	initial := tracker.get(start)
+	assert.Equal(t, ReadinessStarting, initial.Status)
+	assert.False(t, initial.Ready())
+
+	healthy := tracker.recordSuccess(start.Add(time.Second), 20*time.Millisecond)
+	assert.Equal(t, ReadinessHealthy, healthy.Status)
+	assert.True(t, healthy.Ready())
+
+	for failure := 1; failure <= readinessFailureLimit; failure++ {
+		snapshot := tracker.recordFailure(
+			start.Add(time.Duration(failure+1)*time.Second),
+			10*time.Millisecond,
+			ReadinessReasonDefaultRouteInvalid,
+		)
+		assert.Equal(t, failure, snapshot.ConsecutiveFailures)
+		if failure < readinessFailureLimit {
+			assert.Equal(t, ReadinessDegraded, snapshot.Status)
+			assert.True(t, snapshot.Ready())
+		} else {
+			assert.Equal(t, ReadinessUnhealthy, snapshot.Status)
+			assert.False(t, snapshot.Ready())
+		}
+	}
+
+	recovering := tracker.recordSuccess(start.Add(10*time.Second), 5*time.Millisecond)
+	assert.Equal(t, ReadinessUnhealthy, recovering.Status)
+	assert.Equal(t, ReadinessReasonRecovering, recovering.Reason)
+	assert.False(t, recovering.Ready())
+
+	failedRecovery := tracker.recordFailure(
+		start.Add(11*time.Second),
+		5*time.Millisecond,
+		ReadinessReasonDefaultRouteInvalid,
+	)
+	assert.Equal(t, ReadinessUnhealthy, failedRecovery.Status)
+
+	stillRecovering := tracker.recordSuccess(start.Add(12*time.Second), 5*time.Millisecond)
+	assert.Equal(t, ReadinessUnhealthy, stillRecovering.Status)
+	recovered := tracker.recordSuccess(start.Add(13*time.Second), 5*time.Millisecond)
+	assert.Equal(t, ReadinessHealthy, recovered.Status)
+	assert.Empty(t, recovered.Reason)
+}
+
+func TestReadinessDoesNotAdvertiseBeforeFirstSuccess(t *testing.T) {
+	start := time.Date(2026, time.August, 17, 12, 0, 0, 0, time.UTC)
+	tracker := newReadinessTracker(start, readinessStaleAfter)
+
+	for failure := 1; failure < readinessFailureLimit; failure++ {
+		snapshot := tracker.recordFailure(
+			start.Add(time.Duration(failure)*time.Second),
+			time.Millisecond,
+			ReadinessReasonWireGuardUnavailable,
+		)
+		assert.Equal(t, ReadinessStarting, snapshot.Status)
+		assert.False(t, snapshot.Ready())
+	}
+}
+
+func TestReadinessBecomesStale(t *testing.T) {
+	start := time.Date(2026, time.August, 17, 12, 0, 0, 0, time.UTC)
+	tracker := newReadinessTracker(start, readinessStaleAfter)
+
+	assert.Equal(t, ReadinessStale, tracker.get(start.Add(readinessStaleAfter+time.Second)).Status)
+
+	checkedAt := start.Add(2 * time.Minute)
+	tracker.recordSuccess(checkedAt, time.Millisecond)
+	snapshot := tracker.get(checkedAt.Add(readinessStaleAfter + time.Second))
+	assert.Equal(t, ReadinessStale, snapshot.Status)
+	assert.Equal(t, ReadinessReasonCheckStale, snapshot.Reason)
+	assert.False(t, snapshot.Ready())
+
+	firstSuccess := tracker.recordSuccess(checkedAt.Add(readinessStaleAfter+2*time.Second), time.Millisecond)
+	assert.Equal(t, ReadinessUnhealthy, firstSuccess.Status)
+	assert.Equal(t, ReadinessReasonRecovering, firstSuccess.Reason)
+	assert.False(t, firstSuccess.Ready())
+	assert.Equal(t, ReadinessHealthy,
+		tracker.recordSuccess(checkedAt.Add(readinessStaleAfter+3*time.Second), time.Millisecond).Status)
+}
+
+func TestRunReadinessChecksStopsAtFirstFailure(t *testing.T) {
+	var calls []string
+	checks := []readinessCheck{
+		{reason: ReadinessReasonListenerUnavailable, check: func() error {
+			calls = append(calls, "listener")
+			return nil
+		}},
+		{reason: ReadinessReasonDefaultRouteInvalid, check: func() error {
+			calls = append(calls, "route")
+			return errors.New("route missing")
+		}},
+		{reason: ReadinessReasonIptablesRuleMissing, check: func() error {
+			calls = append(calls, "iptables")
+			return nil
+		}},
+	}
+
+	reason, err := runReadinessChecks(checks)
+	require.EqualError(t, err, "route missing")
+	assert.Equal(t, ReadinessReasonDefaultRouteInvalid, reason)
+	assert.Equal(t, []string{"listener", "route"}, calls)
+}
+
+func TestHealthHandlersUseCachedReadiness(t *testing.T) {
+	now := time.Now()
+	srv := &Server{}
+	srv.readiness = &serverReadiness{tracker: newReadinessTracker(now, readinessStaleAfter)}
+
+	request := httptest.NewRequest(http.MethodGet, "/health/ready", nil)
+	response := httptest.NewRecorder()
+	srv.healthReadyHandler(response, request)
+	assert.Equal(t, http.StatusServiceUnavailable, response.Code)
+	assert.Equal(t, "no-store", response.Header().Get("Cache-Control"))
+
+	srv.readiness.tracker.recordSuccess(now.Add(time.Second), time.Millisecond)
+	response = httptest.NewRecorder()
+	srv.healthReadyHandler(response, request)
+	assert.Equal(t, http.StatusOK, response.Code)
+
+	var snapshot ReadinessSnapshot
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &snapshot))
+	assert.Equal(t, ReadinessHealthy, snapshot.Status)
+
+	response = httptest.NewRecorder()
+	srv.healthLiveHandler(response, httptest.NewRequest(http.MethodGet, "/health/live", nil))
+	assert.Equal(t, http.StatusOK, response.Code)
+	assert.JSONEq(t, `{"status":"alive"}`, response.Body.String())
+
+	response = httptest.NewRecorder()
+	srv.healthReadyHandler(response, httptest.NewRequest(http.MethodPost, "/health/ready", nil))
+	assert.Equal(t, http.StatusMethodNotAllowed, response.Code)
+}
+
+func TestRequiredIptablesRules(t *testing.T) {
+	srv := &Server{
+		BindAddr:            netip.MustParseAddr("192.0.2.10"),
+		BindIface:           &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "eth0"}},
+		InternalBindIface:   &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "eth1"}},
+		InternalNetworkCidr: "10.0.0.0/8",
+		WgCidr:              netip.MustParsePrefix("10.1.0.1/24"),
+	}
+
+	assert.Len(t, srv.requiredIptablesRules(), 4)
+
+	srv.Region = "us-west"
+	rules := srv.requiredIptablesRules()
+	require.Len(t, rules, 7)
+	assert.Equal(t, "internal SNAT rule", rules[4].description)
+	assert.Contains(t, rules[4].spec, internalSnatRuleComment)
+}
+
+func TestIsDefaultIPv4Route(t *testing.T) {
+	assert.True(t, isDefaultIPv4Route(netlink.Route{}))
+	assert.True(t, isDefaultIPv4Route(netlink.Route{
+		Dst: &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)},
+	}))
+	assert.False(t, isDefaultIPv4Route(netlink.Route{
+		Dst: &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(1, 32)},
+	}))
+	assert.False(t, isDefaultIPv4Route(netlink.Route{
+		Dst: &net.IPNet{IP: net.ParseIP("::"), Mask: net.CIDRMask(0, 128)},
+	}))
+}

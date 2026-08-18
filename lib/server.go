@@ -107,6 +107,8 @@ type Server struct {
 	// kernel device: an entry is added when a peer is allocated an IP and
 	// removed when the reaper deletes an idle peer.
 	peerIPs map[wgtypes.Key]netip.Addr
+
+	readiness *serverReadiness
 }
 
 // InitState initializes the private server state.
@@ -134,6 +136,7 @@ func (srv *Server) InitState() error {
 	}
 	srv.newPeers = make(map[wgtypes.Key]time.Time)
 	srv.peerIPs = make(map[wgtypes.Key]netip.Addr)
+	srv.initReadiness()
 	return nil
 }
 
@@ -333,7 +336,7 @@ func (srv *Server) canAdoptLink(link netlink.Link) bool {
 	if link.Type() != "wireguard" {
 		return false
 	}
-	addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
+	addrs, err := netlink.AddrList(link, netlinkFamilyV4)
 	if err != nil {
 		return false
 	}
@@ -574,188 +577,145 @@ func (srv *Server) cleanupStaleInternalSnatRules() error {
 	return nil
 }
 
-func (srv *Server) StartIptables() error {
-	// Add masquerade rule for the outbound interface.
-	rule := []string{
-		"-o", srv.BindIface.Attrs().Name,
-		"-j", "MASQUERADE",
-		"-m", "comment", "--comment", fmt.Sprintf("vprox masquerade rule for %s", srv.Ifname()),
-	}
-	if err := srv.Ipt.AppendUnique("nat", "POSTROUTING", rule...); err != nil {
-		return fmt.Errorf("failed to add masquerade rule: %v", err)
-	}
+type iptablesRule struct {
+	table       string
+	chain       string
+	description string
+	spec        []string
+}
 
-	// Add rule to allow forwarding from WireGuard interface
-	rule = []string{
-		"-i", srv.Ifname(),
-		"-j", "ACCEPT",
-		"-m", "comment", "--comment", fmt.Sprintf("vprox forward rule for %s", srv.Ifname()),
+func (srv *Server) commonIptablesRules() []iptablesRule {
+	return []iptablesRule{
+		{
+			table:       "nat",
+			chain:       "POSTROUTING",
+			description: "masquerade rule",
+			spec: []string{
+				"-o", srv.BindIface.Attrs().Name,
+				"-j", "MASQUERADE",
+				"-m", "comment", "--comment", fmt.Sprintf("vprox masquerade rule for %s", srv.Ifname()),
+			},
+		},
+		{
+			table:       "filter",
+			chain:       "FORWARD",
+			description: "forward rule",
+			spec: []string{
+				"-i", srv.Ifname(),
+				"-j", "ACCEPT",
+				"-m", "comment", "--comment", fmt.Sprintf("vprox forward rule for %s", srv.Ifname()),
+			},
+		},
+		{
+			table:       "mangle",
+			chain:       "FORWARD",
+			description: "outbound TCP MSS rule",
+			spec: []string{
+				"-o", srv.Ifname(),
+				"-p", "tcp",
+				"--tcp-flags", "SYN,RST", "SYN",
+				"-j", "TCPMSS",
+				"--clamp-mss-to-pmtu",
+				"-m", "comment", "--comment", fmt.Sprintf("vprox TCP MSS outbound rule for %s", srv.Ifname()),
+			},
+		},
+		{
+			table:       "mangle",
+			chain:       "FORWARD",
+			description: "inbound TCP MSS rule",
+			spec: []string{
+				"-i", srv.Ifname(),
+				"-p", "tcp",
+				"--tcp-flags", "SYN,RST", "SYN",
+				"-j", "TCPMSS",
+				"--clamp-mss-to-pmtu",
+				"-m", "comment", "--comment", fmt.Sprintf("vprox TCP MSS inbound rule for %s", srv.Ifname()),
+			},
+		},
 	}
-	if err := srv.Ipt.AppendUnique("filter", "FORWARD", rule...); err != nil {
-		return fmt.Errorf("failed to add forward rule: %v", err)
-	}
+}
 
-	// Add TCP MSS clamping rules for both directions
-	tcpMssRule := []string{
-		"-o", srv.Ifname(),
-		"-p", "tcp",
-		"--tcp-flags", "SYN,RST", "SYN",
-		"-j", "TCPMSS",
-		"--clamp-mss-to-pmtu",
-		"-m", "comment", "--comment", fmt.Sprintf("vprox TCP MSS outbound rule for %s", srv.Ifname()),
+func (srv *Server) internalIptablesRules() []iptablesRule {
+	if srv.Region != "us-west" {
+		return nil
 	}
-	if err := srv.Ipt.AppendUnique("mangle", "FORWARD", tcpMssRule...); err != nil {
-		return fmt.Errorf("failed to add outbound TCP MSS rule: %v", err)
+	return []iptablesRule{
+		{
+			table:       "nat",
+			chain:       "POSTROUTING",
+			description: "internal SNAT rule",
+			spec: []string{
+				"-s", srv.WgCidr.String(),
+				"-d", srv.InternalNetworkCidr,
+				"-o", srv.InternalBindIface.Attrs().Name,
+				"-j", "SNAT", "--to-source", srv.BindAddr.String(),
+				"-m", "comment", "--comment", internalSnatRuleComment,
+			},
+		},
+		{
+			table:       "filter",
+			chain:       "FORWARD",
+			description: "forward rule from WireGuard to internal network",
+			spec: []string{
+				"-i", srv.Ifname(),
+				"-o", srv.InternalBindIface.Attrs().Name,
+				"-s", srv.WgCidr.String(),
+				"-d", srv.InternalNetworkCidr,
+				"-j", "ACCEPT",
+				"-m", "comment", "--comment", "Forward from WireGuard to internal network",
+			},
+		},
+		{
+			table:       "filter",
+			chain:       "FORWARD",
+			description: "forward rule from internal network to WireGuard",
+			spec: []string{
+				"-i", srv.InternalBindIface.Attrs().Name,
+				"-o", srv.Ifname(),
+				"-s", srv.InternalNetworkCidr,
+				"-d", srv.WgCidr.String(),
+				"-j", "ACCEPT",
+				"-m", "comment", "--comment", "Forward from internal network to WireGuard",
+			},
+		},
 	}
+}
 
-	tcpMssRule = []string{
-		"-i", srv.Ifname(),
-		"-p", "tcp",
-		"--tcp-flags", "SYN,RST", "SYN",
-		"-j", "TCPMSS",
-		"--clamp-mss-to-pmtu",
-		"-m", "comment", "--comment", fmt.Sprintf("vprox TCP MSS inbound rule for %s", srv.Ifname()),
-	}
-	if err := srv.Ipt.AppendUnique("mangle", "FORWARD", tcpMssRule...); err != nil {
-		return fmt.Errorf("failed to add inbound TCP MSS rule: %v", err)
-	}
+func (srv *Server) requiredIptablesRules() []iptablesRule {
+	rules := srv.commonIptablesRules()
+	return append(rules, srv.internalIptablesRules()...)
+}
 
-	// SNAT rule for internal network traffic. This is currently only applicable for boxes in
-	// the US.
-	if srv.Region == "us-west" {
-		// Shutdown intentionally leaves iptables rules in place (see
-		// ServerManager.Start), so if this server's index was previously
-		// bound to a different address, a stale SNAT rule targeting the old
-		// address would precede the one added below and keep matching
-		// internal traffic. Remove any such rules first.
-		if err := srv.cleanupStaleInternalSnatRules(); err != nil {
-			return err
+func (srv *Server) addIptablesRules(rules []iptablesRule) error {
+	for _, rule := range rules {
+		if err := srv.Ipt.AppendUnique(rule.table, rule.chain, rule.spec...); err != nil {
+			return fmt.Errorf("failed to add %s: %v", rule.description, err)
 		}
-
-		rule = []string{
-			"-s", srv.WgCidr.String(),
-			"-d", srv.InternalNetworkCidr,
-			"-o", srv.InternalBindIface.Attrs().Name,
-			"-j", "SNAT", "--to-source", srv.BindAddr.String(),
-			"-m", "comment", "--comment", internalSnatRuleComment,
-		}
-		if err := srv.Ipt.AppendUnique("nat", "POSTROUTING", rule...); err != nil {
-			return fmt.Errorf("failed to add SNAT rule: %v", err)
-		}
-
-		// FORWARD rule from WireGuard to internal network
-		rule = []string{
-			"-i", srv.Ifname(),
-			"-o", srv.InternalBindIface.Attrs().Name,
-			"-s", srv.WgCidr.String(),
-			"-d", srv.InternalNetworkCidr,
-			"-j", "ACCEPT",
-			"-m", "comment", "--comment", "Forward from WireGuard to internal network",
-		}
-		if err := srv.Ipt.AppendUnique("filter", "FORWARD", rule...); err != nil {
-			return fmt.Errorf("failed to add FORWARD rule: %v", err)
-		}
-
-		// FORWARD rule from internal network to WireGuard
-		rule = []string{
-			"-i", srv.InternalBindIface.Attrs().Name,
-			"-o", srv.Ifname(),
-			"-s", srv.InternalNetworkCidr,
-			"-d", srv.WgCidr.String(),
-			"-j", "ACCEPT",
-			"-m", "comment", "--comment", "Forward from internal network to WireGuard",
-		}
-		if err := srv.Ipt.AppendUnique("filter", "FORWARD", rule...); err != nil {
-			return fmt.Errorf("failed to add FORWARD rule: %v", err)
-		}
 	}
-
 	return nil
 }
 
-func (srv *Server) CleanupIptables() {
-	// Remove masquerade rule
-	rule := []string{
-		"-o", srv.BindIface.Attrs().Name,
-		"-j", "MASQUERADE",
-		"-m", "comment", "--comment", fmt.Sprintf("vprox masquerade rule for %s", srv.Ifname()),
-	}
-	if err := srv.Ipt.Delete("nat", "POSTROUTING", rule...); err != nil {
-		log.Printf("failed to remove masquerade rule: %v", err)
+func (srv *Server) StartIptables() error {
+	if err := srv.addIptablesRules(srv.commonIptablesRules()); err != nil {
+		return err
 	}
 
-	// Remove forwarding rule
-	rule = []string{
-		"-i", srv.Ifname(),
-		"-j", "ACCEPT",
-		"-m", "comment", "--comment", fmt.Sprintf("vprox forward rule for %s", srv.Ifname()),
-	}
-	if err := srv.Ipt.Delete("filter", "FORWARD", rule...); err != nil {
-		log.Printf("failed to remove forward rule: %v", err)
-	}
-
-	// Remove TCP MSS clamping rules
-	tcpMssRule := []string{
-		"-o", srv.Ifname(),
-		"-p", "tcp",
-		"--tcp-flags", "SYN,RST", "SYN",
-		"-j", "TCPMSS",
-		"--clamp-mss-to-pmtu",
-		"-m", "comment", "--comment", fmt.Sprintf("vprox TCP MSS outbound rule for %s", srv.Ifname()),
-	}
-	if err := srv.Ipt.Delete("mangle", "FORWARD", tcpMssRule...); err != nil {
-		log.Printf("failed to remove outbound TCP MSS rule: %v", err)
-	}
-
-	tcpMssRule = []string{
-		"-i", srv.Ifname(),
-		"-p", "tcp",
-		"--tcp-flags", "SYN,RST", "SYN",
-		"-j", "TCPMSS",
-		"--clamp-mss-to-pmtu",
-		"-m", "comment", "--comment", fmt.Sprintf("vprox TCP MSS inbound rule for %s", srv.Ifname()),
-	}
-	if err := srv.Ipt.Delete("mangle", "FORWARD", tcpMssRule...); err != nil {
-		log.Printf("failed to remove inbound TCP MSS rule: %v", err)
-	}
-
+	// Shutdown intentionally leaves iptables rules in place (see
+	// ServerManager.Start), so an internal SNAT rule can outlive the bind
+	// address it targeted. Remove stale rules before installing the current
+	// internal-network rules.
 	if srv.Region == "us-west" {
-		// Remove SNAT rule for internal traffic
-		rule = []string{
-			"-s", srv.WgCidr.String(),
-			"-d", srv.InternalNetworkCidr,
-			"-o", srv.InternalBindIface.Attrs().Name,
-			"-j", "SNAT", "--to-source", srv.BindAddr.String(),
-			"-m", "comment", "--comment", "SNAT for WireGuard to internal network",
+		if err := srv.cleanupStaleInternalSnatRules(); err != nil {
+			return err
 		}
-		if err := srv.Ipt.Delete("nat", "POSTROUTING", rule...); err != nil {
-			log.Printf("failed to remove SNAT rule for internal traffic: %v", err)
-		}
+	}
+	return srv.addIptablesRules(srv.internalIptablesRules())
+}
 
-		// Remove forward rule from WireGuard to internal network
-		rule = []string{
-			"-i", srv.Ifname(),
-			"-o", srv.InternalBindIface.Attrs().Name,
-			"-s", srv.WgCidr.String(),
-			"-d", srv.InternalNetworkCidr,
-			"-j", "ACCEPT",
-			"-m", "comment", "--comment", "Forward from WireGuard to internal network",
-		}
-		if err := srv.Ipt.Delete("filter", "FORWARD", rule...); err != nil {
-			log.Printf("failed to remove forward rule from WireGuard to internal network: %v", err)
-		}
-
-		// Remove forward rule from internal network to WireGuard
-		rule = []string{
-			"-i", srv.InternalBindIface.Attrs().Name,
-			"-o", srv.Ifname(),
-			"-s", srv.InternalNetworkCidr,
-			"-d", srv.WgCidr.String(),
-			"-j", "ACCEPT",
-			"-m", "comment", "--comment", "Forward from internal network to WireGuard",
-		}
-		if err := srv.Ipt.Delete("filter", "FORWARD", rule...); err != nil {
-			log.Printf("failed to remove forward rule from internal network to WireGuard: %v", err)
+func (srv *Server) CleanupIptables() {
+	for _, rule := range srv.requiredIptablesRules() {
+		if err := srv.Ipt.Delete(rule.table, rule.chain, rule.spec...); err != nil {
+			log.Printf("failed to remove %s: %v", rule.description, err)
 		}
 	}
 }
@@ -893,6 +853,8 @@ func (srv *Server) ListenForHttps() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.indexHandler)
 	mux.HandleFunc("/connect", srv.connectHandler)
+	mux.HandleFunc("/health/live", srv.healthLiveHandler)
+	mux.HandleFunc("/health/ready", srv.healthReadyHandler)
 
 	cert, err := loadServerTls()
 	if err != nil {
@@ -910,6 +872,8 @@ func (srv *Server) ListenForHttps() error {
 	if err != nil {
 		return fmt.Errorf("failed to listen on :443: %v", err)
 	}
+	srv.readiness.listenerReady.Store(true)
+	defer srv.readiness.listenerReady.Store(false)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -921,6 +885,7 @@ func (srv *Server) ListenForHttps() error {
 			errCh <- nil
 		}
 	}()
+	srv.startReadinessChecks()
 
 	select {
 	case <-srv.Ctx.Done():
