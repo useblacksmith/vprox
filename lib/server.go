@@ -110,21 +110,15 @@ type Server struct {
 
 	readiness *serverReadiness
 
-	// ipipMu protects ipipPeers and ipipClosed. It is separate from mu so
-	// that the IPIP peer bookkeeping does not contend with the WireGuard
-	// peer state.
-	ipipMu    sync.Mutex
-	ipipPeers map[netip.Addr]*ipipPeer
-	// ipipClosed is set by CleanupIpip so that a /connect-ipip handler
-	// that outlives the shutdown drain cannot register a new tunnel after
-	// cleanup has already run.
-	ipipClosed bool
-	// ipipCreateMu serializes the /connect-ipip create path. The kernel
-	// allows only one IPIP tunnel per (local, remote) pair, so two
-	// parallel requests from the same client would both miss the peer
-	// map and the loser's LinkAdd would fail with EEXIST; serializing
-	// creation lets the second request reuse the winner's tunnel.
-	ipipCreateMu sync.Mutex
+	// ipipMu protects ipipPeers, ipipClosed, and the kernel IPIP objects
+	// for those peers (interface, /32 host route, per-peer FORWARD
+	// filter). Hold it through LinkAdd/LinkDel so the map cannot claim
+	// "no tunnel" while the kernel still owns that (local, remote)
+	// pair. It is separate from mu so IPIP bookkeeping does not contend
+	// with WireGuard peer state. Do not hold it across HTTP writes.
+	ipipMu     sync.Mutex
+	ipipPeers  map[netip.Addr]*ipipPeer
+	ipipClosed bool // set by CleanupIpip; lookupOrCreateIpip refuses new tunnels
 }
 
 // InitState initializes the private server state.
