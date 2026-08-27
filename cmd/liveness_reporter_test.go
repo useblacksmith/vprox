@@ -35,11 +35,11 @@ func TestLivenessReporterReportsHealth(t *testing.T) {
 	defer server.Close()
 
 	reporter := &LivenessReporter{
-		client:            http.Client{Timeout: time.Second},
-		backendEndpoint:   server.URL,
-		backendAdminToken: "admin-token",
-		ip:                "192.0.2.10",
-		region:            "test-region",
+		client:          http.Client{Timeout: time.Second},
+		backendEndpoint: server.URL,
+		backendToken:    "admin-token",
+		ip:              "192.0.2.10",
+		region:          "test-region",
 		readinessProvider: func() lib.ReadinessSnapshot {
 			return lib.ReadinessSnapshot{
 				Status:              lib.ReadinessUnhealthy,

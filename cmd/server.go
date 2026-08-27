@@ -118,7 +118,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	defer done()
 
 	backendEndpoint := os.Getenv("BACKEND_ENDPOINT")
-	backendAdminToken := os.Getenv("BACKEND_ADMIN_TOKEN")
+	backendToken := backendServiceKey()
 
 	var serverIPs []netip.Addr
 	for _, ipStr := range serverCmdArgs.ip {
@@ -140,7 +140,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 				ip:                ip.String(),
 				region:            serverCmdArgs.region,
 				backendEndpoint:   backendEndpoint,
-				backendAdminToken: backendAdminToken,
+				backendToken:      backendToken,
 				readinessProvider: func() lib.ReadinessSnapshot { return setupFailure },
 			}
 			reporter.Report(ctx)
@@ -159,7 +159,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 			ip:                ip.String(),
 			region:            serverCmdArgs.region,
 			backendEndpoint:   backendEndpoint,
-			backendAdminToken: backendAdminToken,
+			backendToken:      backendToken,
 			readinessProvider: func() lib.ReadinessSnapshot { return sm.Readiness(ip) },
 		}
 		livenessReporter.Start(ctx)

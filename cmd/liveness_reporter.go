@@ -8,16 +8,27 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/modal-labs/vprox/lib"
 )
 
+// backendServiceKey returns the scoped backend service key (BACKEND_SERVICE_KEY),
+// falling back to the legacy shared admin token (BACKEND_ADMIN_TOKEN) while the
+// fleet migrates to scoped keys.
+func backendServiceKey() string {
+	if key := os.Getenv("BACKEND_SERVICE_KEY"); key != "" {
+		return key
+	}
+	return os.Getenv("BACKEND_ADMIN_TOKEN")
+}
+
 type LivenessReporter struct {
 	client            http.Client
 	backendEndpoint   string
-	backendAdminToken string
+	backendToken      string
 	ip                string
 	region            string
 	readinessProvider func() lib.ReadinessSnapshot
@@ -58,7 +69,7 @@ func (r *LivenessReporter) Report(ctx context.Context) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", r.backendAdminToken))
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", r.backendToken))
 
 	resp, err := r.client.Do(req)
 	if err != nil {
