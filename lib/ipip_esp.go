@@ -21,61 +21,80 @@ import (
 // There is no rekey machinery: a repeated /connect-ipip with esp re-mints
 // and replaces the pair's SAs.
 
-// ipipEspAlgorithm is the AEAD used for IPIP ESP, in Linux crypto API
-// notation. This is AES-GCM with a 128-bit ICV per RFC 4106; macOS setkey
-// calls the same transform "aes-gcm-16". Chosen over aes-cbc+hmac because a
-// single AEAD keeps one key per direction and both kernels support it.
-const ipipEspAlgorithm = "rfc4106(gcm(aes))"
+// ipipEspAlgorithm is the transform used for IPIP ESP, as a wire-protocol
+// name shared with the Mac client: AES-128-CBC encryption with
+// HMAC-SHA-256 authentication truncated to 96 bits. AES-GCM would be
+// preferable (one key, AEAD), but macOS setkey's PF_KEY grammar has no
+// AEAD tokens at all (verified on macOS 26: "syntax error at [aes-gcm]"),
+// so CBC+HMAC is the strongest transform both kernels can install.
+const ipipEspAlgorithm = "aes-cbc+hmac-sha256"
 
-// ipipEspKeyLen is the RFC 4106 key material length: a 128-bit AES key
-// followed by a 4-byte salt.
-const ipipEspKeyLen = 20
+// ipipEspEncKeyLen is the AES-128-CBC key length in bytes.
+const ipipEspEncKeyLen = 16
 
-// ipipEspICVBits is the AEAD integrity tag length in bits.
+// ipipEspAuthKeyLen is the HMAC-SHA-256 key length in bytes.
+const ipipEspAuthKeyLen = 32
+
+// ipipEspICVBits is the HMAC-SHA-256 truncation, in bits. macOS xnu
+// implements RFC 4868 (128-bit truncation) for sha2-256 -- verified on
+// staging by ESP packet-length math and XfrmInStateProtoError counters
+// when Linux was set to the legacy 96-bit KAME truncation.
 const ipipEspICVBits = 128
 
 // ipipEspMinSpi is the smallest SPI we mint; SPIs 0-255 are reserved by
 // RFC 4303.
 const ipipEspMinSpi = 0x100
 
+// ipipEspSA is one freshly minted SA: an SPI, an AES-CBC key, and an
+// HMAC-SHA-256 key.
+type ipipEspSA struct {
+	Spi     uint32
+	EncKey  []byte
+	AuthKey []byte
+}
+
 // ipipEspKeys is one freshly minted SA pair for a client. Directions are
 // named from the traffic's perspective so neither side has to reason about
 // whose "in" it is: ToServer protects client->server packets, ToClient
 // protects server->client packets.
 type ipipEspKeys struct {
-	SpiToServer uint32
-	KeyToServer []byte
-	SpiToClient uint32
-	KeyToClient []byte
+	ToServer ipipEspSA
+	ToClient ipipEspSA
 }
 
-// mintIpipEspKeys mints two SPIs and two AES-GCM keys from crypto/rand.
+// mintIpipEspKeys mints two SPIs and two key sets from crypto/rand.
 func mintIpipEspKeys() (ipipEspKeys, error) {
-	spiToServer, err := mintIpipEspSpi()
+	toServer, err := mintIpipEspSA()
 	if err != nil {
 		return ipipEspKeys{}, err
 	}
-	spiToClient, err := mintIpipEspSpi()
-	for err == nil && spiToClient == spiToServer {
-		spiToClient, err = mintIpipEspSpi()
+	toClient, err := mintIpipEspSA()
+	for err == nil && toClient.Spi == toServer.Spi {
+		toClient, err = mintIpipEspSA()
 	}
 	if err != nil {
 		return ipipEspKeys{}, err
 	}
+	return ipipEspKeys{ToServer: toServer, ToClient: toClient}, nil
+}
 
-	keys := ipipEspKeys{
-		SpiToServer: spiToServer,
-		KeyToServer: make([]byte, ipipEspKeyLen),
-		SpiToClient: spiToClient,
-		KeyToClient: make([]byte, ipipEspKeyLen),
+func mintIpipEspSA() (ipipEspSA, error) {
+	spi, err := mintIpipEspSpi()
+	if err != nil {
+		return ipipEspSA{}, err
 	}
-	if _, err := rand.Read(keys.KeyToServer); err != nil {
-		return ipipEspKeys{}, fmt.Errorf("mint esp key: %v", err)
+	sa := ipipEspSA{
+		Spi:     spi,
+		EncKey:  make([]byte, ipipEspEncKeyLen),
+		AuthKey: make([]byte, ipipEspAuthKeyLen),
 	}
-	if _, err := rand.Read(keys.KeyToClient); err != nil {
-		return ipipEspKeys{}, fmt.Errorf("mint esp key: %v", err)
+	if _, err := rand.Read(sa.EncKey); err != nil {
+		return ipipEspSA{}, fmt.Errorf("mint esp enc key: %v", err)
 	}
-	return keys, nil
+	if _, err := rand.Read(sa.AuthKey); err != nil {
+		return ipipEspSA{}, fmt.Errorf("mint esp auth key: %v", err)
+	}
+	return sa, nil
 }
 
 // mintIpipEspSpi mints a random SPI outside the RFC 4303 reserved range.

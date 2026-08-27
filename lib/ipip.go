@@ -48,11 +48,13 @@ type connectIpipResponse struct {
 // connectIpipEspResponse carries the minted SA material to the client over
 // the TLS control channel. Keys are lowercase hex.
 type connectIpipEspResponse struct {
-	Algorithm   string
-	SpiToServer uint32
-	KeyToServer string
-	SpiToClient uint32
-	KeyToClient string
+	Algorithm       string
+	SpiToServer     uint32
+	EncKeyToServer  string
+	AuthKeyToServer string
+	SpiToClient     uint32
+	EncKeyToClient  string
+	AuthKeyToClient string
 }
 
 // ipipIfnameMaxLen is the maximum visible length of a Linux interface name
@@ -423,16 +425,18 @@ func (srv *Server) finishIpipConnectLocked(p *ipipPeer, esp bool) (resp *connect
 			srv.BindAddr, p.clientIP, p.ifname, err)
 		return nil, "failed to install ESP", http.StatusInternalServerError
 	}
-	p.espSpiToServer, p.espSpiToClient = keys.SpiToServer, keys.SpiToClient
+	p.espSpiToServer, p.espSpiToClient = keys.ToServer.Spi, keys.ToClient.Spi
 	log.Printf("[%v] esp installed for ipip peer %v (%s, spi to-server 0x%x, to-client 0x%x, alg %s)",
-		srv.BindAddr, p.clientIP, p.ifname, keys.SpiToServer, keys.SpiToClient, ipipEspAlgorithm)
+		srv.BindAddr, p.clientIP, p.ifname, keys.ToServer.Spi, keys.ToClient.Spi, ipipEspAlgorithm)
 
 	resp.Esp = &connectIpipEspResponse{
-		Algorithm:   ipipEspAlgorithm,
-		SpiToServer: keys.SpiToServer,
-		KeyToServer: hex.EncodeToString(keys.KeyToServer),
-		SpiToClient: keys.SpiToClient,
-		KeyToClient: hex.EncodeToString(keys.KeyToClient),
+		Algorithm:       ipipEspAlgorithm,
+		SpiToServer:     keys.ToServer.Spi,
+		EncKeyToServer:  hex.EncodeToString(keys.ToServer.EncKey),
+		AuthKeyToServer: hex.EncodeToString(keys.ToServer.AuthKey),
+		SpiToClient:     keys.ToClient.Spi,
+		EncKeyToClient:  hex.EncodeToString(keys.ToClient.EncKey),
+		AuthKeyToClient: hex.EncodeToString(keys.ToClient.AuthKey),
 	}
 	return resp, "", 0
 }

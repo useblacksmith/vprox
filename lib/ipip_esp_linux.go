@@ -17,43 +17,42 @@ import (
 const ipProtoIpip = 4
 
 // ipipEspMtu is the MTU set on an IPIP interface once its outer path is
-// ESP-wrapped. Transport-mode AES-GCM ESP adds up to ~56 bytes on top of
-// the 20-byte IPIP outer header, so the default 1480 no longer fits in a
-// 1500-byte physical MTU; 1440 leaves headroom (1440 + 20 + 36 = 1496).
-// The wildcard --clamp-mss-to-pmtu MSS rules pick this up automatically.
-const ipipEspMtu = 1440
+// ESP-wrapped. Transport-mode AES-CBC ESP adds up to ~57 bytes (8 ESP
+// header + 16 IV + pad-to-16 + 2 trailer + 16 ICV) on top of the 20-byte
+// IPIP outer header, so the default 1480 no longer fits in a 1500-byte
+// physical MTU; worst case at 1424 is 1424 + 6 pad + 20 + 56 = 1492. The
+// wildcard --clamp-mss-to-pmtu MSS rules pick this up automatically.
+const ipipEspMtu = 1424
+
+// ipipEspXfrmState builds one transport-mode ESP xfrm state.
+func ipipEspXfrmState(src, dst netip.Addr, sa ipipEspSA) *netlink.XfrmState {
+	return &netlink.XfrmState{
+		Src:          addrToIp(src),
+		Dst:          addrToIp(dst),
+		Proto:        netlink.XFRM_PROTO_ESP,
+		Mode:         netlink.XFRM_MODE_TRANSPORT,
+		Spi:          int(sa.Spi),
+		ReplayWindow: 32,
+		Crypt: &netlink.XfrmStateAlgo{
+			Name: "cbc(aes)",
+			Key:  sa.EncKey,
+		},
+		Auth: &netlink.XfrmStateAlgo{
+			Name: "hmac(sha256)",
+			Key:  sa.AuthKey,
+			// RFC 4868 truncation, matching macOS xnu. Linux's legacy
+			// default for hmac(sha256) is 96 bits, which does NOT
+			// interop, so this must be explicit.
+			TruncateLen: ipipEspICVBits,
+		},
+	}
+}
 
 // ipipEspStates returns the two transport-mode SAs for a client pair, in
 // (to-server, to-client) order.
 func (srv *Server) ipipEspStates(clientIP netip.Addr, keys ipipEspKeys) (toServer, toClient *netlink.XfrmState) {
-	server := addrToIp(srv.BindAddr)
-	client := addrToIp(clientIP)
-	toServer = &netlink.XfrmState{
-		Src:          client,
-		Dst:          server,
-		Proto:        netlink.XFRM_PROTO_ESP,
-		Mode:         netlink.XFRM_MODE_TRANSPORT,
-		Spi:          int(keys.SpiToServer),
-		ReplayWindow: 32,
-		Aead: &netlink.XfrmStateAlgo{
-			Name:   ipipEspAlgorithm,
-			Key:    keys.KeyToServer,
-			ICVLen: ipipEspICVBits,
-		},
-	}
-	toClient = &netlink.XfrmState{
-		Src:          server,
-		Dst:          client,
-		Proto:        netlink.XFRM_PROTO_ESP,
-		Mode:         netlink.XFRM_MODE_TRANSPORT,
-		Spi:          int(keys.SpiToClient),
-		ReplayWindow: 32,
-		Aead: &netlink.XfrmStateAlgo{
-			Name:   ipipEspAlgorithm,
-			Key:    keys.KeyToClient,
-			ICVLen: ipipEspICVBits,
-		},
-	}
+	toServer = ipipEspXfrmState(clientIP, srv.BindAddr, keys.ToServer)
+	toClient = ipipEspXfrmState(srv.BindAddr, clientIP, keys.ToClient)
 	return toServer, toClient
 }
 
