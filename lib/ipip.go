@@ -25,9 +25,9 @@ type ipipPeer struct {
 	peerIP   netip.Addr // inner address allocated from srv.WgCidr
 	ifname   string     // Linux interface name (e.g. vp0-1)
 
-	lastSeen time.Time // last time we observed activity from this peer
-	rxBytes  uint64    // rx bytes observed at lastSeen, for activity detection
-	txBytes  uint64    // tx bytes observed at lastSeen, for activity detection
+	lastSeen time.Time // last /connect-ipip or restore time
+	rxBytes  uint64
+	txBytes  uint64
 }
 
 type connectIpipResponse struct {
@@ -79,10 +79,9 @@ func (srv *Server) ipipIfaceWildcard() string {
 }
 
 // ipipPeerFromIfname is the inverse of ipipIfname: it recovers the peer's
-// inner IP from a "vp<srv.Index>-<offset>" interface name. The startup sweep
-// uses it to remove the per-peer iptables rules of tunnels left over from a
-// previous process. Returns false if the name does not belong to this
-// server's IPIP interfaces.
+// inner IP from a "vp<srv.Index>-<offset>" interface name. Restore uses it
+// to adopt leftover tunnels (and to identify invalid leftovers to delete).
+// Returns false if the name does not belong to this server's IPIP interfaces.
 func (srv *Server) ipipPeerFromIfname(ifname string) (netip.Addr, bool) {
 	suffix, found := strings.CutPrefix(ifname, fmt.Sprintf("vp%d-", srv.Index))
 	if !found {
@@ -102,35 +101,170 @@ func (srv *Server) ipipPeerFromIfname(ifname string) (netip.Addr, bool) {
 	}), true
 }
 
-// SweepStaleIpip removes IPIP interfaces (and their per-peer iptables rules)
-// left over from a previous process. CleanupIpip only runs on a clean
-// shutdown; after a crash or SIGKILL the interfaces survive while the new
-// process starts with an empty allocator, so a leftover /32 host route could
-// blackhole an IP the allocator later hands to a new WireGuard or IPIP peer.
-// There is no adopt-on-restart path for IPIP (unlike WireGuard), so any
-// surviving vp<srv.Index>-* tunnel is stale by definition.
+// ipipRestoreKind is the restore planner's decision for one leftover iface.
+type ipipRestoreKind int
+
+const (
+	ipipRestoreIgnore ipipRestoreKind = iota // name is not this server's vp<idx>-*
+	ipipRestoreAdopt
+	ipipRestoreDelete
+)
+
+const (
+	ipipRestoreReasonNotIptun        = "not an iptun device"
+	ipipRestoreReasonUnusableRemote  = "missing or unusable remote"
+	ipipRestoreReasonDuplicateRemote = "duplicate remote"
+	ipipRestoreReasonClaimFailed     = "inner IP already claimed or outside prefix"
+)
+
+// ipipRestoreCandidate is one leftover iface after name/type/remote
+// classification. Kind may be upgraded from adopt to delete by planIpipRestore.
+type ipipRestoreCandidate struct {
+	Ifname string
+	PeerIP netip.Addr
+	Remote netip.Addr // outer/client IP; zero if unusable
+	Kind   ipipRestoreKind
+	Reason string
+}
+
+// usableIpipRemote reports whether an Iptun Remote is a specified IPv4
+// address that can key ipipPeers.
+func usableIpipRemote(remote net.IP) (netip.Addr, bool) {
+	if len(remote) == 0 {
+		return netip.Addr{}, false
+	}
+	ipv4 := remote.To4()
+	if ipv4 == nil {
+		return netip.Addr{}, false
+	}
+	addr := netip.AddrFrom4([4]byte{ipv4[0], ipv4[1], ipv4[2], ipv4[3]})
+	if addr.IsUnspecified() {
+		return netip.Addr{}, false
+	}
+	return addr, true
+}
+
+// classifyIpipLink decides whether a leftover iface is ours to ignore, adopt,
+// or delete, based only on name parseability, link type, and Remote.
+// Duplicate Remote and Claim failures are applied later by planIpipRestore.
+func classifyIpipLink(ifname string, isIptun bool, remote net.IP, parse func(string) (netip.Addr, bool)) ipipRestoreCandidate {
+	peerIP, ok := parse(ifname)
+	if !ok {
+		return ipipRestoreCandidate{Ifname: ifname, Kind: ipipRestoreIgnore}
+	}
+	c := ipipRestoreCandidate{Ifname: ifname, PeerIP: peerIP}
+	if !isIptun {
+		c.Kind = ipipRestoreDelete
+		c.Reason = ipipRestoreReasonNotIptun
+		return c
+	}
+	addr, ok := usableIpipRemote(remote)
+	if !ok {
+		c.Kind = ipipRestoreDelete
+		c.Reason = ipipRestoreReasonUnusableRemote
+		return c
+	}
+	c.Remote = addr
+	c.Kind = ipipRestoreAdopt
+	return c
+}
+
+// planIpipRestore applies Claim and duplicate-Remote rules to classified
+// candidates. Adoptables that lose Claim or collide on Remote become deletes.
+// claim is called only for would-adopt candidates, in list order. The first
+// successful Claim for a given Remote is kept; later collisions are deleted
+// without claiming their inner IP.
+func planIpipRestore(candidates []ipipRestoreCandidate, claim func(netip.Addr) bool) (adopt, del []ipipRestoreCandidate) {
+	seenRemote := make(map[netip.Addr]struct{})
+	for _, c := range candidates {
+		switch c.Kind {
+		case ipipRestoreIgnore:
+			continue
+		case ipipRestoreDelete:
+			del = append(del, c)
+		case ipipRestoreAdopt:
+			if _, dup := seenRemote[c.Remote]; dup {
+				c.Kind = ipipRestoreDelete
+				c.Reason = ipipRestoreReasonDuplicateRemote
+				del = append(del, c)
+				continue
+			}
+			if !claim(c.PeerIP) {
+				c.Kind = ipipRestoreDelete
+				c.Reason = ipipRestoreReasonClaimFailed
+				del = append(del, c)
+				continue
+			}
+			seenRemote[c.Remote] = struct{}{}
+			adopt = append(adopt, c)
+		}
+	}
+	return adopt, del
+}
+
+// RestoreIpipFromKernel adopts leftover IPIP tunnels into Go state and
+// deletes only invalid leftovers. Analogous to RestorePeersFromKernel: the
+// kernel dataplane keeps forwarding across deploys, and Mac clients cache
+// gif with no keepalive, so deleting a valid vp* on restart would black
+// them out. A leftover 10.100.x/32 on an IPIP iface wins over WireGuard's
+// connected /16, so invalid leftovers must still be removed (and those
+// deletes must succeed) before we become ready.
 //
-// Sweep runs once at startup, before ListenForHttps, so there are no
-// concurrent /connect-ipip handlers. It does not take ipipMu: it never
-// touches ipipPeers (the map is empty) and holding the lock across a
-// LinkList plus every leftover LinkDel would only delay listen.
-func (srv *Server) SweepStaleIpip() error {
+// Restore runs once at startup, after RestorePeersFromKernel (so WireGuard
+// claims win if both somehow own the same inner IP) and before
+// ListenForHttps. There are no concurrent /connect-ipip handlers yet, so
+// LinkList and orphan teardown do not take ipipMu; the lock is taken only
+// to insert restored peers into ipipPeers.
+func (srv *Server) RestoreIpipFromKernel() error {
 	links, err := netlink.LinkList()
 	if err != nil {
-		return fmt.Errorf("list links for ipip sweep: %v", err)
+		return fmt.Errorf("list links for ipip restore: %v", err)
 	}
+
+	classified := make([]ipipRestoreCandidate, 0, len(links))
 	for _, link := range links {
-		ifname := link.Attrs().Name
-		peerIP, ok := srv.ipipPeerFromIfname(ifname)
-		if !ok {
-			continue
+		tun, isIptun := link.(*netlink.Iptun)
+		var remote net.IP
+		if isIptun {
+			remote = tun.Remote
 		}
-		if _, isIptun := link.(*netlink.Iptun); !isIptun {
-			continue
+		classified = append(classified, classifyIpipLink(
+			link.Attrs().Name, isIptun, remote, srv.ipipPeerFromIfname))
+	}
+
+	adopt, del := planIpipRestore(classified, srv.ipAllocator.Claim)
+
+	now := time.Now()
+	srv.ipipMu.Lock()
+	for _, c := range adopt {
+		srv.ipipPeers[c.Remote] = &ipipPeer{
+			clientIP: c.Remote,
+			peerIP:   c.PeerIP,
+			ifname:   c.Ifname,
+			lastSeen: now,
 		}
-		log.Printf("[%v] sweeping stale ipip tunnel %s (peer %v)",
-			srv.BindAddr, ifname, peerIP)
-		srv.tearDownIpipLink(ifname, peerIP)
+	}
+	srv.ipipMu.Unlock()
+
+	if len(adopt) > 0 {
+		log.Printf("[%v] restored %d ipip tunnel(s) from kernel",
+			srv.BindAddr, len(adopt))
+	}
+
+	for _, c := range adopt {
+		log.Printf("[%v] restored ipip tunnel %s (peer %v, remote %v)",
+			srv.BindAddr, c.Ifname, c.PeerIP, c.Remote)
+		if err := srv.addIpipPeerFilter(c.Ifname, c.PeerIP); err != nil {
+			return fmt.Errorf("restore ipip filter for %s: %v", c.Ifname, err)
+		}
+	}
+
+	for _, c := range del {
+		log.Printf("[%v] removing invalid leftover ipip iface %s (peer %v): %s",
+			srv.BindAddr, c.Ifname, c.PeerIP, c.Reason)
+		if err := srv.tearDownIpipLink(c.Ifname, c.PeerIP); err != nil {
+			return fmt.Errorf("tear down invalid ipip leftover %s: %v", c.Ifname, err)
+		}
 	}
 	return nil
 }
@@ -194,8 +328,7 @@ func (srv *Server) lookupOrCreateIpip(clientIP netip.Addr) (assigned, errMsg str
 		// Only a genuine "not found" counts as vanished. A transient
 		// lookup failure must not tear down a working tunnel.
 		_, lookupErr := netlink.LinkByName(existing.ifname)
-		var notFound netlink.LinkNotFoundError
-		vanished := errors.As(lookupErr, &notFound)
+		vanished := ipipLinkNotFound(lookupErr)
 		if lookupErr != nil && !vanished {
 			log.Printf("[%v] ipip iface %s lookup failed transiently (%v); reusing",
 				srv.BindAddr, existing.ifname, lookupErr)
@@ -206,8 +339,12 @@ func (srv *Server) lookupOrCreateIpip(clientIP netip.Addr) (assigned, errMsg str
 		}
 		log.Printf("[%v] ipip iface %s for %v vanished; rebuilding",
 			srv.BindAddr, existing.ifname, clientIP)
+		if err := srv.dropIpipPeerLocked(existing); err != nil {
+			log.Printf("[%v] failed to tear down vanished ipip iface %s for %v: %v; leaving in place",
+				srv.BindAddr, existing.ifname, clientIP, err)
+			return "", "failed to rebuild IPIP tunnel", http.StatusInternalServerError
+		}
 		delete(srv.ipipPeers, clientIP)
-		srv.dropIpipPeerLocked(existing)
 	}
 
 	return srv.createIpipPeerLocked(clientIP)
@@ -239,9 +376,13 @@ func (srv *Server) createIpipPeerLocked(clientIP netip.Addr) (assigned, errMsg s
 		return "", "ipip ifname out of range", http.StatusInternalServerError
 	}
 	if err := srv.createIpipLink(ifname, clientIP, peerIP); err != nil {
-		srv.ipAllocator.Free(peerIP)
-		log.Printf("[%v] failed to create IPIP tunnel for %v: %v",
-			srv.BindAddr, clientIP, err)
+		if srv.freeIpipIPIfIfaceGone(ifname, peerIP) {
+			log.Printf("[%v] failed to create IPIP tunnel for %v: %v",
+				srv.BindAddr, clientIP, err)
+		} else {
+			log.Printf("[%v] failed to create IPIP tunnel for %v: %v; iface %s may still exist, leaving %v allocated",
+				srv.BindAddr, clientIP, err, ifname, peerIP)
+		}
 		return "", "failed to create IPIP tunnel", http.StatusInternalServerError
 	}
 
@@ -258,12 +399,45 @@ func (srv *Server) createIpipPeerLocked(clientIP netip.Addr) (assigned, errMsg s
 	return fmt.Sprintf("%v/%d", peerIP, srv.WgCidr.Bits()), "", 0
 }
 
-// dropIpipPeerLocked removes the kernel objects and frees the inner IP for
-// p. Caller must hold ipipMu and must already have deleted p from
-// ipipPeers (or be replacing the whole map).
-func (srv *Server) dropIpipPeerLocked(p *ipipPeer) {
-	srv.tearDownIpipLink(p.ifname, p.peerIP)
+// dropIpipPeerLocked tears down p's kernel objects and, only after the
+// iface is confirmed gone, frees its inner IP. Caller must hold ipipMu
+// and must not have deleted p from ipipPeers yet. On error the map entry,
+// allocator claim, and kernel iface are left as-is.
+func (srv *Server) dropIpipPeerLocked(p *ipipPeer) error {
+	if err := srv.tearDownIpipLink(p.ifname, p.peerIP); err != nil {
+		return err
+	}
 	srv.ipAllocator.Free(p.peerIP)
+	return nil
+}
+
+// freeIpipIPIfIfaceGone Frees peerIP only if ifname is confirmed absent
+// (LinkNotFound). Any other LinkByName result means the kernel object may
+// still hold the /32, so the address stays allocated. Returns true if the
+// IP was freed.
+func (srv *Server) freeIpipIPIfIfaceGone(ifname string, peerIP netip.Addr) bool {
+	_, err := netlink.LinkByName(ifname)
+	if ipipLinkNotFound(err) {
+		srv.ipAllocator.Free(peerIP)
+		return true
+	}
+	if err != nil {
+		log.Printf("[%v] ipip iface %s lookup failed during create rollback (%v); leaving %v allocated",
+			srv.BindAddr, ifname, err, peerIP)
+		return false
+	}
+	log.Printf("[%v] ipip iface %s still exists after create failure; leaving %v allocated",
+		srv.BindAddr, ifname, peerIP)
+	return false
+}
+
+// ipipLinkNotFound reports a genuine missing iface. Only this error means
+// the kernel object is gone and its inner IP may be Freed. A nil error
+// (iface exists) or any other lookup failure means the /32 may still be
+// installed.
+func ipipLinkNotFound(err error) bool {
+	var notFound netlink.LinkNotFoundError
+	return errors.As(err, &notFound)
 }
 
 func writeIpipResponse(w http.ResponseWriter, assigned string) {
@@ -321,7 +495,7 @@ func (srv *Server) createIpipLink(ifname string, remote, peerIP netip.Addr) erro
 	route := &netlink.Route{
 		LinkIndex: resolved.Attrs().Index,
 		Dst:       &dst,
-		Scope:     netlink.SCOPE_LINK,
+		Scope:     netlinkScopeLink,
 	}
 	if err := netlink.RouteReplace(route); err != nil {
 		_ = netlink.LinkDel(resolved)
@@ -346,21 +520,24 @@ func (srv *Server) createIpipLink(ifname string, remote, peerIP netip.Addr) erro
 }
 
 // tearDownIpipLink removes the per-peer iptables filter and the IPIP
-// interface. The interface deletion is what carries the kernel state;
-// removing the iptables rules first keeps them from referencing a vanished
-// interface for the brief window before they're cleaned up.
-func (srv *Server) tearDownIpipLink(ifname string, peerIP netip.Addr) {
+// interface. The interface is the source of truth: LinkNotFound is success
+// (already gone), any other lookup or LinkDel error is returned so the
+// caller does not Free the inner IP or drop the map entry. Filter removal
+// is best-effort; a surviving iface is not treated as torn down.
+func (srv *Server) tearDownIpipLink(ifname string, peerIP netip.Addr) error {
 	srv.removeIpipPeerFilter(ifname, peerIP)
 
 	link, err := netlink.LinkByName(ifname)
 	if err != nil {
-		// Already gone; nothing to do.
-		return
+		if ipipLinkNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("lookup ipip link %s: %v", ifname, err)
 	}
 	if err := netlink.LinkDel(link); err != nil {
-		log.Printf("[%v] failed to delete ipip link %s: %v",
-			srv.BindAddr, ifname, err)
+		return fmt.Errorf("delete ipip link %s: %v", ifname, err)
 	}
+	return nil
 }
 
 // ipipPeerAcceptRule is the iptables rule that permits forwarded traffic
@@ -415,7 +592,7 @@ func (srv *Server) removeIpipPeerFilter(ifname string, peerIP netip.Addr) {
 	}
 }
 
-func (srv *Server) removeIdleIpipPeersLoop() {
+func (srv *Server) removeVanishedIpipPeersLoop() {
 	for {
 		select {
 		case <-srv.Ctx.Done():
@@ -423,20 +600,21 @@ func (srv *Server) removeIdleIpipPeersLoop() {
 		case <-time.After(5 * time.Second):
 		}
 
-		srv.removeIdleIpipPeers()
+		srv.removeVanishedIpipPeers()
 	}
 }
 
-// removeIdleIpipPeers prunes IPIP peers whose tunnel has seen no traffic for
-// longer than PeerIdleTimeout. Activity is detected by polling the
-// interface's rx_bytes and tx_bytes counters via netlink; counting both
-// directions means a peer in the middle of a one-way transfer (e.g. a
-// download with little return traffic) is not pruned mid-stream.
+// removeVanishedIpipPeers reaps IPIP peers whose kernel iface is already
+// gone. Mac clients have no keepalive and cache gif across a quiet VM, so
+// we must not delete a living tunnel after PeerIdleTimeout — that would
+// blackhole return traffic the same way a restart sweep of valid vp* does.
 //
-// Stats probes run without ipipMu so a full scan does not stall handshakes.
-// Map updates and kernel teardown run under the lock so we never delete the
-// map entry while leaving vp0-N in the kernel (or the reverse).
-func (srv *Server) removeIdleIpipPeers() {
+// If the kernel already deleted vp*, tearing down filters and Freeing the
+// inner IP is correct: there is no leftover /32. Lookups run without
+// ipipMu so a full scan does not stall handshakes. Teardown, Free, and map
+// delete run under the lock, in that order; a teardown error leaves the
+// map entry and allocator claim in place for the next tick.
+func (srv *Server) removeVanishedIpipPeers() {
 	srv.ipipMu.Lock()
 	type snapshot struct {
 		clientIP netip.Addr
@@ -449,14 +627,14 @@ func (srv *Server) removeIdleIpipPeers() {
 	}
 	srv.ipipMu.Unlock()
 
-	now := time.Now()
 	for _, s := range snaps {
-		link, err := netlink.LinkByName(s.ifname)
-		var notFound netlink.LinkNotFoundError
-		vanished := errors.As(err, &notFound)
-		if err != nil && !vanished {
+		_, err := netlink.LinkByName(s.ifname)
+		if err != nil && !ipipLinkNotFound(err) {
 			log.Printf("[%v] ipip iface %s lookup failed transiently (%v); will retry",
 				srv.BindAddr, s.ifname, err)
+			continue
+		}
+		if err == nil {
 			continue
 		}
 
@@ -466,49 +644,36 @@ func (srv *Server) removeIdleIpipPeers() {
 			srv.ipipMu.Unlock()
 			continue
 		}
-		if vanished {
-			delete(srv.ipipPeers, s.clientIP)
-			log.Printf("[%v] removing vanished ipip peer %v at %v",
-				srv.BindAddr, s.clientIP, s.peer.peerIP)
-			srv.dropIpipPeerLocked(s.peer)
+		if err := srv.dropIpipPeerLocked(s.peer); err != nil {
+			log.Printf("[%v] failed to tear down vanished ipip peer %v at %v (%s): %v; will retry",
+				srv.BindAddr, s.clientIP, s.peer.peerIP, s.peer.ifname, err)
 			srv.ipipMu.Unlock()
 			continue
 		}
-		stats := link.Attrs().Statistics
-		var rx, tx uint64
-		if stats != nil {
-			rx = stats.RxBytes
-			tx = stats.TxBytes
-		}
-		if rx != current.rxBytes || tx != current.txBytes {
-			current.rxBytes = rx
-			current.txBytes = tx
-			current.lastSeen = now
-		}
-		if now.Sub(current.lastSeen) > PeerIdleTimeout {
-			delete(srv.ipipPeers, s.clientIP)
-			log.Printf("[%v] removing idle ipip peer %v at %v",
-				srv.BindAddr, s.clientIP, current.peerIP)
-			srv.dropIpipPeerLocked(current)
-		}
+		delete(srv.ipipPeers, s.clientIP)
+		log.Printf("[%v] removed vanished ipip peer %v at %v",
+			srv.BindAddr, s.clientIP, s.peer.peerIP)
 		srv.ipipMu.Unlock()
 	}
 }
 
 // CleanupIpip tears down every IPIP interface this server created. It is
-// safe to call multiple times.
+// available for manual decommissioning (like CleanupWireguard) and is not
+// called on process shutdown: the kernel dataplane keeps forwarding across
+// deploys. Safe to call multiple times. A teardown error leaves that peer's
+// map entry and allocator claim in place.
 func (srv *Server) CleanupIpip() {
 	srv.ipipMu.Lock()
 	defer srv.ipipMu.Unlock()
 
 	srv.ipipClosed = true
-	peers := make([]*ipipPeer, 0, len(srv.ipipPeers))
-	for _, p := range srv.ipipPeers {
-		peers = append(peers, p)
-	}
-	srv.ipipPeers = make(map[netip.Addr]*ipipPeer)
-	for _, p := range peers {
-		srv.dropIpipPeerLocked(p)
+	for clientIP, p := range srv.ipipPeers {
+		if err := srv.dropIpipPeerLocked(p); err != nil {
+			log.Printf("[%v] failed to decommission ipip peer %v (%s): %v; leaving in place",
+				srv.BindAddr, clientIP, p.ifname, err)
+			continue
+		}
+		delete(srv.ipipPeers, clientIP)
 	}
 }
 

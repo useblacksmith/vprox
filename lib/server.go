@@ -728,10 +728,11 @@ func (srv *Server) StartIptables() error {
 	}
 
 	// Wildcard TCP MSS clamping for this server's IPIP interfaces. The
-	// interfaces themselves are created lazily by /connect-ipip; the
-	// FORWARD ACCEPT/DROP filter is installed per peer at that point so
-	// each tunnel only accepts traffic with the inner source IP we
-	// assigned to it (see addIpipPeerFilter).
+	// interfaces themselves are created lazily by /connect-ipip or restored
+	// from leftover kernel tunnels at startup; the FORWARD ACCEPT/DROP
+	// filter is installed per peer at that point so each tunnel only
+	// accepts traffic with the inner source IP we assigned to it (see
+	// addIpipPeerFilter).
 	if err := srv.iptablesIpipMssRules(true); err != nil {
 		return fmt.Errorf("failed to add ipip MSS rules: %v", err)
 	}
@@ -907,7 +908,7 @@ func (srv *Server) ListenForHttps() error {
 	}
 
 	go srv.removeIdlePeersLoop()
-	go srv.removeIdleIpipPeersLoop()
+	go srv.removeVanishedIpipPeersLoop()
 
 	// Some bind addresses may not have been added to the network interface. If
 	// that is the case, we need to add it (transiently).
@@ -955,9 +956,10 @@ func (srv *Server) ListenForHttps() error {
 		log.Printf("server no longer listening on %v:443\n", srv.BindAddr)
 		// srv.Ctx is already cancelled here, so passing it to Shutdown
 		// would return immediately without draining in-flight handlers.
-		// Drain with a fresh deadline so handlers (notably /connect-ipip,
-		// whose tunnels are torn down right after this function returns)
-		// finish before cleanup runs.
+		// Drain with a fresh deadline so in-flight handlers (notably
+		// /connect-ipip) finish. Kernel IPIP tunnels are left in place
+		// across shutdown, like WireGuard, so a cached Mac gif keeps
+		// working across deploys.
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		return httpServer.Shutdown(shutdownCtx)

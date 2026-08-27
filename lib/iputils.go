@@ -17,6 +17,10 @@ import (
 // compile without changing Linux behavior.
 const netlinkFamilyV4 = 2
 
+// RT_SCOPE_LINK from the Linux netlink ABI (unix.RT_SCOPE_LINK). Same
+// rationale as netlinkFamilyV4: netlink.SCOPE_LINK exists only on Linux.
+const netlinkScopeLink = 0xfd
+
 // prefixToIPNet converts a netip.Prefix to a net.IPNet.
 func prefixToIPNet(prefix netip.Prefix) net.IPNet {
 	ip := net.IP(prefix.Addr().AsSlice())
