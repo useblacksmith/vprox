@@ -1,6 +1,7 @@
 package lib
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,10 +29,30 @@ type ipipPeer struct {
 	lastSeen time.Time // last /connect-ipip or restore time
 	rxBytes  uint64
 	txBytes  uint64
+
+	// espSpiToServer/ToClient are the SPIs of the pair's current ESP SAs,
+	// or 0 for plaintext peers (and adopted peers, whose SPIs live only in
+	// the kernel until the client re-keys). Kept for log lines; the keys
+	// themselves are never stored.
+	espSpiToServer uint32
+	espSpiToClient uint32
 }
 
 type connectIpipResponse struct {
 	AssignedAddr string
+	// Esp is present only when the request asked for it; old clients see
+	// exactly the pre-ESP response shape.
+	Esp *connectIpipEspResponse `json:",omitempty"`
+}
+
+// connectIpipEspResponse carries the minted SA material to the client over
+// the TLS control channel. Keys are lowercase hex.
+type connectIpipEspResponse struct {
+	Algorithm   string
+	SpiToServer uint32
+	KeyToServer string
+	SpiToClient uint32
+	KeyToClient string
 }
 
 // ipipIfnameMaxLen is the maximum visible length of a Linux interface name
@@ -265,6 +286,14 @@ func (srv *Server) RestoreIpipFromKernel() error {
 		if err := srv.tearDownIpipLink(c.Ifname, c.PeerIP); err != nil {
 			return fmt.Errorf("tear down invalid ipip leftover %s: %v", c.Ifname, err)
 		}
+		// Adopted pairs keep their kernel xfrm untouched (the SAs keep
+		// encrypting across the restart); deleted leftovers lose theirs.
+		if c.Remote.IsValid() {
+			if err := srv.removeIpipEsp(c.Remote); err != nil {
+				log.Printf("[%v] failed to remove esp for deleted ipip leftover %s (client %v): %v",
+					srv.BindAddr, c.Ifname, c.Remote, err)
+			}
+		}
 	}
 	return nil
 }
@@ -304,24 +333,31 @@ func (srv *Server) connectIpipHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	assigned, errMsg, errStatus := srv.lookupOrCreateIpip(clientIP)
+	req, err := parseConnectIpipRequest(r.Body)
+	if err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	resp, errMsg, errStatus := srv.lookupOrCreateIpip(clientIP, req.Esp)
 	if errMsg != "" {
 		http.Error(w, errMsg, errStatus)
 		return
 	}
-	writeIpipResponse(w, assigned)
+	writeIpipResponse(w, resp)
 }
 
-// lookupOrCreateIpip returns the inner address for clientIP, creating the
-// kernel tunnel if needed. It holds ipipMu for the whole lookup/create so
-// the peer map and the kernel (local, remote) pair stay in lockstep. The
-// HTTP response is written by the caller after this returns.
-func (srv *Server) lookupOrCreateIpip(clientIP netip.Addr) (assigned, errMsg string, errStatus int) {
+// lookupOrCreateIpip returns the connect response for clientIP, creating the
+// kernel tunnel if needed and installing (or removing) the pair's ESP state
+// per the request. It holds ipipMu for the whole lookup/create so the peer
+// map and the kernel (local, remote) pair stay in lockstep, and so ESP state
+// is installed before the HTTP response is written by the caller.
+func (srv *Server) lookupOrCreateIpip(clientIP netip.Addr, esp bool) (resp *connectIpipResponse, errMsg string, errStatus int) {
 	srv.ipipMu.Lock()
 	defer srv.ipipMu.Unlock()
 
 	if srv.ipipClosed {
-		return "", "server shutting down", http.StatusServiceUnavailable
+		return nil, "server shutting down", http.StatusServiceUnavailable
 	}
 
 	if existing, ok := srv.ipipPeers[clientIP]; ok {
@@ -335,45 +371,95 @@ func (srv *Server) lookupOrCreateIpip(clientIP netip.Addr) (assigned, errMsg str
 		}
 		if !vanished {
 			existing.lastSeen = time.Now()
-			return fmt.Sprintf("%v/%d", existing.peerIP, srv.WgCidr.Bits()), "", 0
+			return srv.finishIpipConnectLocked(existing, esp)
 		}
 		log.Printf("[%v] ipip iface %s for %v vanished; rebuilding",
 			srv.BindAddr, existing.ifname, clientIP)
 		if err := srv.dropIpipPeerLocked(existing); err != nil {
 			log.Printf("[%v] failed to tear down vanished ipip iface %s for %v: %v; leaving in place",
 				srv.BindAddr, existing.ifname, clientIP, err)
-			return "", "failed to rebuild IPIP tunnel", http.StatusInternalServerError
+			return nil, "failed to rebuild IPIP tunnel", http.StatusInternalServerError
 		}
 		delete(srv.ipipPeers, clientIP)
 	}
 
-	return srv.createIpipPeerLocked(clientIP)
+	peer, errMsg, errStatus := srv.createIpipPeerLocked(clientIP)
+	if errMsg != "" {
+		return nil, errMsg, errStatus
+	}
+	return srv.finishIpipConnectLocked(peer, esp)
+}
+
+// finishIpipConnectLocked applies the request's ESP choice to an existing or
+// freshly created peer and builds the response. Caller must hold ipipMu.
+//
+// esp mints a fresh SA pair and replaces whatever the kernel holds for the
+// pair (there is no rekey machinery; re-connecting IS the rekey). Plaintext
+// removes any leftover ESP state so an old (or rolled-back) client gets
+// exactly today's behavior instead of a require-ESP policy blackholing it.
+func (srv *Server) finishIpipConnectLocked(p *ipipPeer, esp bool) (resp *connectIpipResponse, errMsg string, errStatus int) {
+	resp = &connectIpipResponse{
+		AssignedAddr: fmt.Sprintf("%v/%d", p.peerIP, srv.WgCidr.Bits()),
+	}
+
+	if !esp {
+		if err := srv.removeIpipEsp(p.clientIP); err != nil {
+			log.Printf("[%v] esp remove FAILED for plaintext ipip peer %v (%s): %v",
+				srv.BindAddr, p.clientIP, p.ifname, err)
+			return nil, "failed to remove stale ESP state", http.StatusInternalServerError
+		}
+		p.espSpiToServer, p.espSpiToClient = 0, 0
+		return resp, "", 0
+	}
+
+	keys, err := mintIpipEspKeys()
+	if err != nil {
+		log.Printf("[%v] esp key minting failed for ipip peer %v: %v",
+			srv.BindAddr, p.clientIP, err)
+		return nil, "failed to mint ESP keys", http.StatusInternalServerError
+	}
+	if err := srv.installIpipEsp(p.clientIP, p.ifname, keys); err != nil {
+		log.Printf("[%v] esp install FAILED for ipip peer %v (%s): %v",
+			srv.BindAddr, p.clientIP, p.ifname, err)
+		return nil, "failed to install ESP", http.StatusInternalServerError
+	}
+	p.espSpiToServer, p.espSpiToClient = keys.SpiToServer, keys.SpiToClient
+	log.Printf("[%v] esp installed for ipip peer %v (%s, spi to-server 0x%x, to-client 0x%x, alg %s)",
+		srv.BindAddr, p.clientIP, p.ifname, keys.SpiToServer, keys.SpiToClient, ipipEspAlgorithm)
+
+	resp.Esp = &connectIpipEspResponse{
+		Algorithm:   ipipEspAlgorithm,
+		SpiToServer: keys.SpiToServer,
+		KeyToServer: hex.EncodeToString(keys.KeyToServer),
+		SpiToClient: keys.SpiToClient,
+		KeyToClient: hex.EncodeToString(keys.KeyToClient),
+	}
+	return resp, "", 0
 }
 
 // createIpipPeerLocked allocates an inner IP, creates the IPIP tunnel, and
-// registers the peer. Caller must hold ipipMu. On success it returns the
-// assigned inner address in CIDR notation; on failure a non-empty errMsg
-// and HTTP status.
-func (srv *Server) createIpipPeerLocked(clientIP netip.Addr) (assigned, errMsg string, errStatus int) {
+// registers the peer. Caller must hold ipipMu. On failure it returns a
+// non-empty errMsg and HTTP status.
+func (srv *Server) createIpipPeerLocked(clientIP netip.Addr) (peer *ipipPeer, errMsg string, errStatus int) {
 	if winner, ok := srv.ipipPeers[clientIP]; ok {
 		winner.lastSeen = time.Now()
-		return fmt.Sprintf("%v/%d", winner.peerIP, srv.WgCidr.Bits()), "", 0
+		return winner, "", 0
 	}
 	if srv.ipipClosed {
-		return "", "server shutting down", http.StatusServiceUnavailable
+		return nil, "server shutting down", http.StatusServiceUnavailable
 	}
 
 	peerIP := srv.ipAllocator.Allocate()
 	if peerIP.IsUnspecified() {
 		log.Printf("no more ip addresses available in %v", srv.WgCidr)
-		return "", "no more IP addresses available", http.StatusServiceUnavailable
+		return nil, "no more IP addresses available", http.StatusServiceUnavailable
 	}
 
 	ifname, err := srv.ipipIfname(peerIP)
 	if err != nil {
 		srv.ipAllocator.Free(peerIP)
 		log.Printf("[%v] %v", srv.BindAddr, err)
-		return "", "ipip ifname out of range", http.StatusInternalServerError
+		return nil, "ipip ifname out of range", http.StatusInternalServerError
 	}
 	if err := srv.createIpipLink(ifname, clientIP, peerIP); err != nil {
 		if srv.freeIpipIPIfIfaceGone(ifname, peerIP) {
@@ -383,20 +469,21 @@ func (srv *Server) createIpipPeerLocked(clientIP netip.Addr) (assigned, errMsg s
 			log.Printf("[%v] failed to create IPIP tunnel for %v: %v; iface %s may still exist, leaving %v allocated",
 				srv.BindAddr, clientIP, err, ifname, peerIP)
 		}
-		return "", "failed to create IPIP tunnel", http.StatusInternalServerError
+		return nil, "failed to create IPIP tunnel", http.StatusInternalServerError
 	}
 
-	srv.ipipPeers[clientIP] = &ipipPeer{
+	peer = &ipipPeer{
 		clientIP: clientIP,
 		peerIP:   peerIP,
 		ifname:   ifname,
 		lastSeen: time.Now(),
 	}
+	srv.ipipPeers[clientIP] = peer
 
 	log.Printf("[%v] new ipip peer %v at %v (iface %s)",
 		srv.BindAddr, clientIP, peerIP, ifname)
 
-	return fmt.Sprintf("%v/%d", peerIP, srv.WgCidr.Bits()), "", 0
+	return peer, "", 0
 }
 
 // dropIpipPeerLocked tears down p's kernel objects and, only after the
@@ -406,6 +493,16 @@ func (srv *Server) createIpipPeerLocked(clientIP netip.Addr) (assigned, errMsg s
 func (srv *Server) dropIpipPeerLocked(p *ipipPeer) error {
 	if err := srv.tearDownIpipLink(p.ifname, p.peerIP); err != nil {
 		return err
+	}
+	// ESP removal is best-effort: a leftover SA/policy for a gone pair
+	// cannot blackhole anyone else's traffic (the selector is scoped to
+	// this client pair) and is replaced on the client's next connect.
+	if err := srv.removeIpipEsp(p.clientIP); err != nil {
+		log.Printf("[%v] esp remove FAILED during teardown of ipip peer %v (%s, spi to-server 0x%x, to-client 0x%x): %v; continuing",
+			srv.BindAddr, p.clientIP, p.ifname, p.espSpiToServer, p.espSpiToClient, err)
+	} else if p.espSpiToServer != 0 {
+		log.Printf("[%v] esp removed for ipip peer %v (%s, spi to-server 0x%x, to-client 0x%x)",
+			srv.BindAddr, p.clientIP, p.ifname, p.espSpiToServer, p.espSpiToClient)
 	}
 	srv.ipAllocator.Free(p.peerIP)
 	return nil
@@ -440,8 +537,7 @@ func ipipLinkNotFound(err error) bool {
 	return errors.As(err, &notFound)
 }
 
-func writeIpipResponse(w http.ResponseWriter, assigned string) {
-	resp := &connectIpipResponse{AssignedAddr: assigned}
+func writeIpipResponse(w http.ResponseWriter, resp *connectIpipResponse) {
 	respBuf, err := json.Marshal(resp)
 	if err != nil {
 		http.Error(w, "failed to serialize response", http.StatusInternalServerError)
