@@ -32,10 +32,31 @@ type ipipPeer struct {
 
 	// espSpiToServer/ToClient are the SPIs of the pair's current ESP SAs,
 	// or 0 for plaintext peers (and adopted peers, whose SPIs live only in
-	// the kernel until the client re-keys). Kept for log lines; the keys
-	// themselves are never stored.
+	// the kernel until the client re-keys). Kept for log lines and as the
+	// rekey GC keep-set; the keys themselves are never stored beyond an
+	// in-flight rekey (see espPendingToClient).
 	espSpiToServer uint32
 	espSpiToClient uint32
+
+	// espRekeyEpoch increments on every request that changes the pair's
+	// ESP state (rekey mint, destructive replace, plaintext strip) and on
+	// teardown. The background switch/GC goroutines spawned by a rekey
+	// capture the epoch and abort once superseded, so a stale poller can
+	// never install or delete SAs that belong to a newer request.
+	espRekeyEpoch uint64
+
+	// espPendingToClient is the freshly minted outbound SA of an in-flight
+	// rekey. It is held (keys included) only until the switch installs it
+	// -- when the client's first packet arrives on the new inbound SA, or
+	// on switch timeout -- and is cleared when superseded.
+	espPendingToClient *ipipEspSA
+
+	// espPrevSpiToServer is the previous inbound generation protected
+	// from this epoch's GC (the client's rollback target; see
+	// ipipEspGcLoop). espPrevSpiToClient is the previous outbound SPI,
+	// kept for log lines only.
+	espPrevSpiToServer uint32
+	espPrevSpiToClient uint32
 }
 
 type connectIpipResponse struct {
@@ -340,8 +361,12 @@ func (srv *Server) connectIpipHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
+	if err := req.validate(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
-	resp, errMsg, errStatus := srv.lookupOrCreateIpip(clientIP, req.Esp)
+	resp, errMsg, errStatus := srv.lookupOrCreateIpip(clientIP, req)
 	if errMsg != "" {
 		http.Error(w, errMsg, errStatus)
 		return
@@ -354,7 +379,7 @@ func (srv *Server) connectIpipHandler(w http.ResponseWriter, r *http.Request) {
 // per the request. It holds ipipMu for the whole lookup/create so the peer
 // map and the kernel (local, remote) pair stay in lockstep, and so ESP state
 // is installed before the HTTP response is written by the caller.
-func (srv *Server) lookupOrCreateIpip(clientIP netip.Addr, esp bool) (resp *connectIpipResponse, errMsg string, errStatus int) {
+func (srv *Server) lookupOrCreateIpip(clientIP netip.Addr, req connectIpipRequest) (resp *connectIpipResponse, errMsg string, errStatus int) {
 	srv.ipipMu.Lock()
 	defer srv.ipipMu.Unlock()
 
@@ -373,7 +398,7 @@ func (srv *Server) lookupOrCreateIpip(clientIP netip.Addr, esp bool) (resp *conn
 		}
 		if !vanished {
 			existing.lastSeen = time.Now()
-			return srv.finishIpipConnectLocked(existing, esp)
+			return srv.finishIpipConnectLocked(existing, req)
 		}
 		log.Printf("[%v] ipip iface %s for %v vanished; rebuilding",
 			srv.BindAddr, existing.ifname, clientIP)
@@ -389,28 +414,38 @@ func (srv *Server) lookupOrCreateIpip(clientIP netip.Addr, esp bool) (resp *conn
 	if errMsg != "" {
 		return nil, errMsg, errStatus
 	}
-	return srv.finishIpipConnectLocked(peer, esp)
+	return srv.finishIpipConnectLocked(peer, req)
 }
 
 // finishIpipConnectLocked applies the request's ESP choice to an existing or
 // freshly created peer and builds the response. Caller must hold ipipMu.
 //
-// esp mints a fresh SA pair and replaces whatever the kernel holds for the
-// pair (there is no rekey machinery; re-connecting IS the rekey). Plaintext
-// removes any leftover ESP state so an old (or rolled-back) client gets
-// exactly today's behavior instead of a require-ESP policy blackholing it.
-func (srv *Server) finishIpipConnectLocked(p *ipipPeer, esp bool) (resp *connectIpipResponse, errMsg string, errStatus int) {
+// esp (without rekey) mints a fresh SA pair and replaces whatever the
+// kernel holds for the pair -- the destructive fresh-connect semantics.
+// esp+rekey rotates SA generations additively (see the package comment in
+// ipip_esp.go). Plaintext removes any leftover ESP state so an old (or
+// rolled-back) client gets exactly today's behavior instead of a
+// require-ESP policy blackholing it.
+//
+// Every branch bumps espRekeyEpoch first, so any in-flight rekey
+// switch/GC goroutine from a previous request aborts instead of touching
+// state that this request supersedes.
+func (srv *Server) finishIpipConnectLocked(p *ipipPeer, req connectIpipRequest) (resp *connectIpipResponse, errMsg string, errStatus int) {
 	resp = &connectIpipResponse{
 		AssignedAddr: fmt.Sprintf("%v/%d", p.peerIP, srv.WgCidr.Bits()),
 	}
 
-	if !esp {
+	p.espRekeyEpoch++
+	p.espPendingToClient = nil
+
+	if !req.Esp {
 		if err := srv.removeIpipEsp(p.clientIP); err != nil {
 			log.Printf("[%v] esp remove FAILED for plaintext ipip peer %v (%s): %v",
 				srv.BindAddr, p.clientIP, p.ifname, err)
 			return nil, "failed to remove stale ESP state", http.StatusInternalServerError
 		}
 		p.espSpiToServer, p.espSpiToClient = 0, 0
+		p.espPrevSpiToServer, p.espPrevSpiToClient = 0, 0
 		return resp, "", 0
 	}
 
@@ -420,14 +455,24 @@ func (srv *Server) finishIpipConnectLocked(p *ipipPeer, esp bool) (resp *connect
 			srv.BindAddr, p.clientIP, err)
 		return nil, "failed to mint ESP keys", http.StatusInternalServerError
 	}
-	if err := srv.installIpipEsp(p.clientIP, p.ifname, keys); err != nil {
-		log.Printf("[%v] esp install FAILED for ipip peer %v (%s): %v",
-			srv.BindAddr, p.clientIP, p.ifname, err)
-		return nil, "failed to install ESP", http.StatusInternalServerError
+
+	if req.Rekey {
+		if err := srv.rekeyIpipEsp(p, keys); err != nil {
+			log.Printf("[%v] esp rekey FAILED for ipip peer %v (%s): %v",
+				srv.BindAddr, p.clientIP, p.ifname, err)
+			return nil, "failed to rekey ESP", http.StatusInternalServerError
+		}
+	} else {
+		if err := srv.installIpipEsp(p.clientIP, p.ifname, keys); err != nil {
+			log.Printf("[%v] esp install FAILED for ipip peer %v (%s): %v",
+				srv.BindAddr, p.clientIP, p.ifname, err)
+			return nil, "failed to install ESP", http.StatusInternalServerError
+		}
+		p.espSpiToServer, p.espSpiToClient = keys.ToServer.Spi, keys.ToClient.Spi
+		p.espPrevSpiToServer, p.espPrevSpiToClient = 0, 0
+		log.Printf("[%v] esp installed for ipip peer %v (%s, spi to-server 0x%x, to-client 0x%x, alg %s)",
+			srv.BindAddr, p.clientIP, p.ifname, keys.ToServer.Spi, keys.ToClient.Spi, ipipEspAlgorithm)
 	}
-	p.espSpiToServer, p.espSpiToClient = keys.ToServer.Spi, keys.ToClient.Spi
-	log.Printf("[%v] esp installed for ipip peer %v (%s, spi to-server 0x%x, to-client 0x%x, alg %s)",
-		srv.BindAddr, p.clientIP, p.ifname, keys.ToServer.Spi, keys.ToClient.Spi, ipipEspAlgorithm)
 
 	resp.Esp = &connectIpipEspResponse{
 		Algorithm:       ipipEspAlgorithm,

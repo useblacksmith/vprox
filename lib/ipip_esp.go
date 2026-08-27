@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/netip"
 )
 
 // ESP for IPIP tunnels.
@@ -18,8 +19,27 @@ import (
 // proto-4 traffic between the two hosts, and returns the key material in the
 // response. The response rides the same TLS channel that already carries the
 // bearer password, so no extra key-exchange protocol (IKE, DH) is needed.
-// There is no rekey machinery: a repeated /connect-ipip with esp re-mints
-// and replaces the pair's SAs.
+//
+// Rekey. The SAs have no lifetimes and no ESN (macOS setkey cannot install
+// ESN), so a non-ESN SA hard-stops at seq 2^32; clients must rotate SA
+// generations before that. {"esp": true, "rekey": true} is the rotation
+// request: the server mints a fresh generation, installs only its new
+// INBOUND (client->server) SA alongside the existing ones, and returns the
+// material. Its outbound is switched to the new generation by a background
+// poll once the new inbound SA's packet counter first ticks (i.e. the
+// client demonstrably transmits on the new generation), or after a timeout.
+// Old generations are garbage-collected a grace period after a
+// counter-confirmed switch; a timeout-switch skips GC because the client
+// may have rolled back to the previous generation (its health check
+// failed), and deleting that generation's inbound SA would cut it off. The
+// GC sweep is list-based (delete everything for the pair except the
+// current generation), so it also collects generations orphaned by a vprox
+// restart losing the in-memory map.
+//
+// A plain {"esp": true} (no rekey) keeps the original destructive-replace
+// semantics for fresh connects: delete every SA for the pair, install one
+// new generation. A rekey request for a pair with no live SAs falls back
+// to that same full install.
 
 // ipipEspAlgorithm is the transform used for IPIP ESP, as a wire-protocol
 // name shared with the Mac client: AES-128-CBC encryption with
@@ -112,9 +132,78 @@ func mintIpipEspSpi() (uint32, error) {
 }
 
 // connectIpipRequest is the (optional) JSON body of POST /connect-ipip.
-// Old clients send an empty body or {} and get plaintext IPIP.
+// Old clients send an empty body or {} and get plaintext IPIP. Rekey asks
+// for an additive SA-generation rotation instead of a destructive replace;
+// it is only meaningful with Esp (see validate).
 type connectIpipRequest struct {
-	Esp bool `json:"esp"`
+	Esp   bool `json:"esp"`
+	Rekey bool `json:"rekey"`
+}
+
+// validate rejects request combinations that have no defined semantics.
+func (r connectIpipRequest) validate() error {
+	if r.Rekey && !r.Esp {
+		return fmt.Errorf("rekey requires esp")
+	}
+	return nil
+}
+
+// ipipEspStateKey identifies one kernel ESP state by direction and SPI.
+// The rekey switch and GC paths work on these instead of full xfrm states
+// so the selection logic is pure and testable off-Linux. AddTime is the
+// kernel's install timestamp (seconds), used to pick the newest previous
+// inbound generation; it survives vprox restarts because it lives in the
+// kernel, not in this process.
+type ipipEspStateKey struct {
+	Src     netip.Addr
+	Dst     netip.Addr
+	Spi     uint32
+	AddTime uint64
+}
+
+// newestIpipEspInboundSpi returns the SPI of the newest (by kernel
+// AddTime) client->server state other than excludeSpi, or 0 if none. A
+// rekey protects this generation from the post-switch GC: the client's
+// rollback path returns its outbound to exactly this generation, and
+// "vprox keeps accepting both" is the rollback contract. Using kernel
+// AddTime (not in-memory bookkeeping) keeps the choice correct across
+// vprox restarts.
+func newestIpipEspInboundSpi(states []ipipEspStateKey, client, server netip.Addr, excludeSpi uint32) uint32 {
+	var best ipipEspStateKey
+	found := false
+	for _, s := range states {
+		if s.Src != client || s.Dst != server || s.Spi == excludeSpi {
+			continue
+		}
+		if !found || s.AddTime > best.AddTime {
+			best = s
+			found = true
+		}
+	}
+	if !found {
+		return 0
+	}
+	return best.Spi
+}
+
+// ipipEspStatesToDelete returns the states flowing src->dst whose SPI is
+// not in keep. States for other address pairs (or the reverse direction)
+// are never selected. The rekey outbound switch uses it with the new
+// generation's SPI as the only keeper; GC uses it per direction with the
+// current generation pair, which also sweeps generations orphaned by a
+// restart that lost the in-memory bookkeeping.
+func ipipEspStatesToDelete(states []ipipEspStateKey, src, dst netip.Addr, keep map[uint32]struct{}) []ipipEspStateKey {
+	var victims []ipipEspStateKey
+	for _, s := range states {
+		if s.Src != src || s.Dst != dst {
+			continue
+		}
+		if _, keepIt := keep[s.Spi]; keepIt {
+			continue
+		}
+		victims = append(victims, s)
+	}
+	return victims
 }
 
 // ipipRequestBodyLimit bounds how much of the request body we read; the

@@ -19,3 +19,7 @@ func (srv *Server) installIpipEsp(clientIP netip.Addr, ifname string, keys ipipE
 func (srv *Server) removeIpipEsp(clientIP netip.Addr) error {
 	return nil
 }
+
+func (srv *Server) rekeyIpipEsp(p *ipipPeer, keys ipipEspKeys) error {
+	return errors.New("ipip esp rekey requires linux xfrm")
+}
