@@ -38,37 +38,6 @@ type connectIpipResponse struct {
 // (IFNAMSIZ is 16 including the null terminator).
 const ipipIfnameMaxLen = 15
 
-// ipipKernelOpWarnAfter is how long createIpipLink / tearDownIpipLink may
-// block on netlink or xtables before we log. A hang here holds ipipMu, so
-// every /connect-ipip waits; the user-visible signal is VM static-IP setup
-// failures. The log is so those alerts are diagnosable.
-const ipipKernelOpWarnAfter = 5 * time.Second
-
-// watchIpipKernelOp logs if a kernel/iptables op is still running after
-// ipipKernelOpWarnAfter, and again when it finally returns if it was slow.
-// Call as `defer srv.watchIpipKernelOp("create vp0-1")()`.
-func (srv *Server) watchIpipKernelOp(op string) func() {
-	start := time.Now()
-	done := make(chan struct{})
-	go func() {
-		t := time.NewTimer(ipipKernelOpWarnAfter)
-		defer t.Stop()
-		select {
-		case <-done:
-		case <-t.C:
-			log.Printf("[%v] ipip %s still in progress after %s (netlink/xtables?)",
-				srv.BindAddr, op, time.Since(start).Round(time.Millisecond))
-		}
-	}()
-	return func() {
-		close(done)
-		if d := time.Since(start); d >= ipipKernelOpWarnAfter {
-			log.Printf("[%v] ipip %s finished after %s",
-				srv.BindAddr, op, d.Round(time.Millisecond))
-		}
-	}
-}
-
 // ipipIfname returns the Linux interface name used for the IPIP tunnel to
 // the peer at peerIP.
 //
@@ -319,8 +288,6 @@ func writeIpipResponse(w http.ResponseWriter, assigned string) {
 // correct tunnel, and the MASQUERADE rule already in place on srv.BindIface
 // handles outbound NAT.
 func (srv *Server) createIpipLink(ifname string, remote, peerIP netip.Addr) error {
-	defer srv.watchIpipKernelOp("create " + ifname)()
-
 	link := &netlink.Iptun{
 		LinkAttrs: netlink.LinkAttrs{Name: ifname},
 		Local:     addrToIp(srv.BindAddr),
@@ -383,8 +350,6 @@ func (srv *Server) createIpipLink(ifname string, remote, peerIP netip.Addr) erro
 // removing the iptables rules first keeps them from referencing a vanished
 // interface for the brief window before they're cleaned up.
 func (srv *Server) tearDownIpipLink(ifname string, peerIP netip.Addr) {
-	defer srv.watchIpipKernelOp("teardown " + ifname)()
-
 	srv.removeIpipPeerFilter(ifname, peerIP)
 
 	link, err := netlink.LinkByName(ifname)
