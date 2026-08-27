@@ -163,6 +163,7 @@ func (sm *ServerManager) Start(ip netip.Addr) error {
 		// stale /32 routes can blackhole freshly allocated peer IPs.
 		defer srv.CleanupIpip()
 		if err := srv.SweepStaleIpip(); err != nil {
+			srv.markReadinessFatal(ReadinessReasonServerSetupFailed)
 			log.Printf("[%v] failed to sweep stale ipip tunnels: %v", ip, err)
 			return
 		}
