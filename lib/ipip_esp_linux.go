@@ -212,8 +212,8 @@ func (srv *Server) installIpipEsp(clientIP netip.Addr, ifname string, keys ipipE
 
 // removeIpipEsp removes the pair's require-ESP policies and every ESP SA
 // between srv.BindAddr and clientIP. Missing objects are not an error, so
-// this is safe to call for peers that never had ESP (plaintext requests and
-// teardown call it unconditionally). Policy deletion is keyed by selector
+// this is safe to call for peers that never had ESP installed (teardown
+// and restore call it unconditionally). Policy deletion is keyed by selector
 // and direction, so the template reqid passed here is irrelevant.
 func (srv *Server) removeIpipEsp(clientIP netip.Addr) error {
 	polIn, polOut := srv.ipipEspPolicies(clientIP, 0)
@@ -267,20 +267,26 @@ func xfrmNotFound(err error) bool {
 	return errors.Is(err, syscall.ESRCH) || errors.Is(err, syscall.ENOENT)
 }
 
-// Rekey timing. The GC gate poll watches the newly activated generation's
-// inbound SA for its first packet -- the client switches its outbound and
-// health-checks within seconds of ACTIVATE, so 60s of 500ms polls is
-// generous; on timeout NOTHING is deleted (the next successful rotation's
-// sweep collects stragglers). The GC grace lets in-flight packets on the
-// old generation drain before old states are deleted. The pending reap
-// deletes a PREPAREd generation the client never activated or abandoned
-// (helper died mid-protocol); it fires well after any legitimate
-// in-protocol gap, and only if no other request touched the pair since.
+// Rekey timing. The activation gate poll watches the newly activated
+// generation's inbound SA for its first packet -- the client switches its
+// outbound and health-checks within seconds of ACTIVATE, so the ~2 minute
+// gate is generous. A packet within the gate is the on-the-wire proof
+// that arms the counter-gated GC; gate EXPIRY means the client never
+// completed its switch (and its ABANDON, if it sent one, was lost), so
+// the activation is auto-reverted: the outbound policy flips back to the
+// previous generation's reqid (replay-safe -- the old state was never
+// deleted and its sequence counter kept counting). Old states are still
+// never deleted on expiry. The GC grace lets in-flight packets on the old
+// generation drain before old states are deleted after a PROVEN
+// activation. The pending reap deletes a PREPAREd generation the client
+// never activated or abandoned (helper died mid-protocol); it fires well
+// after any legitimate in-protocol gap, and only if no other request
+// touched the pair since.
 const (
-	ipipEspGcGatePoll    = 500 * time.Millisecond
-	ipipEspGcGateTimeout = 60 * time.Second
-	ipipEspGcGrace       = 2 * time.Minute
-	ipipEspPendingReap   = 5 * time.Minute
+	ipipEspGcGatePoll     = 500 * time.Millisecond
+	ipipEspActivationGate = 2 * time.Minute
+	ipipEspGcGrace        = 2 * time.Minute
+	ipipEspPendingReap    = 5 * time.Minute
 )
 
 // prepareIpipEspRekey is the PREPARE step of the forward-only rotation.
@@ -520,12 +526,15 @@ func (srv *Server) abandonIpipEsp(p *ipipPeer, spiToClient uint32) error {
 	return nil
 }
 
-// ipipEspGcGateLoop is the counter gate for old-generation GC after an
-// ACTIVATE: it waits for the first packet on the newly active generation's
-// INBOUND SA -- on-the-wire proof the client completed its own switch --
-// then, after a grace period, sweeps every other state of the pair. On
-// timeout it deletes NOTHING; stragglers wait for the next successful
-// rotation's sweep.
+// ipipEspGcGateLoop is the counter gate after an ACTIVATE: it waits for
+// the first packet on the newly active generation's INBOUND SA --
+// on-the-wire proof the client completed its own switch -- then, after a
+// grace period, sweeps every other state of the pair. On gate expiry it
+// deletes NOTHING, but the activation was provisional: the outbound
+// policy flip is auto-reverted to the previous generation (see
+// autoRevertIpipEspActivation), because a client that never transmitted
+// on the new generation either failed its own switch or lost its ABANDON,
+// and leaving the pair emitting on an unproven generation strands it.
 func (srv *Server) ipipEspGcGateLoop(clientIP netip.Addr, epoch uint64, newSpiToServer uint32) {
 	lookup := &netlink.XfrmState{
 		Src:   addrToIp(clientIP),
@@ -533,7 +542,7 @@ func (srv *Server) ipipEspGcGateLoop(clientIP netip.Addr, epoch uint64, newSpiTo
 		Proto: netlink.XFRM_PROTO_ESP,
 		Spi:   int(newSpiToServer),
 	}
-	deadline := time.Now().Add(ipipEspGcGateTimeout)
+	deadline := time.Now().Add(ipipEspActivationGate)
 	confirmed := false
 	for time.Now().Before(deadline) {
 		select {
@@ -558,8 +567,7 @@ func (srv *Server) ipipEspGcGateLoop(clientIP netip.Addr, epoch uint64, newSpiTo
 		}
 	}
 	if !confirmed {
-		log.Printf("[%v] esp GC gate timed out for %v (no packets on new inbound spi 0x%x); deleting nothing, next rotation sweeps",
-			srv.BindAddr, clientIP, newSpiToServer)
+		srv.autoRevertIpipEspActivation(clientIP, epoch, newSpiToServer)
 		return
 	}
 
@@ -607,6 +615,74 @@ func (srv *Server) ipipEspGcGateLoop(clientIP netip.Addr, epoch uint64, newSpiTo
 	if len(deleted) == 0 {
 		log.Printf("[%v] esp rekey GC for %v: nothing to sweep", srv.BindAddr, clientIP)
 	}
+}
+
+// autoRevertIpipEspActivation walks back a PROVISIONAL activation whose
+// gate expired without a single packet on the new generation's inbound
+// SA: the outbound policy template flips back to the previous
+// generation's reqid, exactly like a client ABANDON of the activated
+// generation. Replay-safe -- the previous outbound state was never
+// deleted, so Linux resumes its sequence counter. Nothing is deleted
+// here; the unproven generation's states stay installed until a later
+// successful rotation's sweep.
+//
+// This is what makes a LOST ABANDON harmless: a client whose proof failed
+// walks away and retries with a fresh generation while still transmitting
+// on the old one; without the revert, its abandon message was the only
+// thing standing between the pair and a server stuck emitting on a
+// generation the client can't decrypt.
+//
+// Idempotency with ABANDON (either order):
+//   - ABANDON first: it re-assigns the peer epoch, so the epoch check
+//     here fails and the auto-revert is a no-op.
+//   - Auto-revert first: it restores the previous generation as active
+//     and re-assigns the epoch, so a late ABANDON of the reverted
+//     generation matches neither pending nor active and no-ops.
+//   - Belt and braces, the kernel policy reqid is checked to still be the
+//     activated generation's before flipping anything.
+func (srv *Server) autoRevertIpipEspActivation(clientIP netip.Addr, epoch uint64, newSpiToServer uint32) {
+	srv.ipipMu.Lock()
+	defer srv.ipipMu.Unlock()
+
+	p, ok := srv.ipipPeers[clientIP]
+	if !ok || p.espRekeyEpoch != epoch {
+		log.Printf("[%v] esp activation gate expired for %v (spi to-server 0x%x) but a newer request superseded it; not reverting",
+			srv.BindAddr, clientIP, newSpiToServer)
+		return
+	}
+	if !p.espPrevReqidValid {
+		log.Printf("[%v] esp AUTO-REVERT impossible for %v: activation gate expired (no packets on inbound spi 0x%x) but no pre-activation policy reqid is recorded; leaving policy as-is, next rotation heals",
+			srv.BindAddr, clientIP, newSpiToServer)
+		return
+	}
+	activatedReqid := ipipEspReqid(p.espSpiToClient)
+	curReqid, found, err := srv.outboundIpipEspPolicyReqid(clientIP)
+	if err != nil {
+		log.Printf("[%v] esp AUTO-REVERT aborted for %v: cannot read outbound policy: %v",
+			srv.BindAddr, clientIP, err)
+		return
+	}
+	if !found || curReqid != activatedReqid {
+		log.Printf("[%v] esp auto-revert for %v: outbound policy no longer selects the activated generation (reqid 0x%x, want 0x%x); already reverted or superseded, nothing to do",
+			srv.BindAddr, clientIP, curReqid, activatedReqid)
+		return
+	}
+
+	_, polOut := srv.ipipEspPolicies(clientIP, p.espPrevReqid)
+	if err := netlink.XfrmPolicyUpdate(polOut); err != nil {
+		log.Printf("[%v] esp AUTO-REVERT FAILED for %v: flip outbound policy back to reqid 0x%x: %v; pair may be emitting on an unproven generation",
+			srv.BindAddr, clientIP, p.espPrevReqid, err)
+		return
+	}
+	log.Printf("[%v] esp AUTO-REVERT for ipip peer %v (%s): activation gate expired with zero packets on new inbound (spi 0x%x); outbound policy flipped back to reqid 0x%x (spi to-client 0x%x restored as active). The client never proved the generation (failed switch or lost ABANDON); its states stay installed until a later rotation sweeps them",
+		srv.BindAddr, clientIP, p.ifname, newSpiToServer, p.espPrevReqid, p.espPrevSpiToClient)
+
+	p.espSpiToServer, p.espSpiToClient = p.espPrevSpiToServer, p.espPrevSpiToClient
+	p.espPrevSpiToServer, p.espPrevSpiToClient = 0, 0
+	p.espPrevReqid, p.espPrevReqidValid = 0, false
+	// Supersede the activation's epoch so a duplicate/late ABANDON (or any
+	// other goroutine keyed to the activation) is a strict no-op.
+	p.espRekeyEpoch = srv.nextEspEpochLocked()
 }
 
 // ipipEspPendingReapLoop deletes a prepared generation the client never

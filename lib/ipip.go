@@ -31,9 +31,9 @@ type ipipPeer struct {
 	txBytes  uint64
 
 	// espSpiToServer/ToClient are the SPIs of the pair's ACTIVE ESP
-	// generation (the one the outbound policy emits), or 0 for plaintext
-	// peers (and adopted peers, whose SPIs live only in the kernel until
-	// the client re-keys). Kept for log lines and as the GC keep-set; SA
+	// generation (the one the outbound policy emits), or 0 for adopted
+	// peers (whose SPIs live only in the kernel until the client
+	// re-keys). Kept for log lines and as the GC keep-set; SA
 	// keys are never stored -- a prepared generation's material lives only
 	// in the kernel and in the HTTP response that delivered it.
 	espSpiToServer uint32
@@ -41,8 +41,8 @@ type ipipPeer struct {
 
 	// espRekeyEpoch is reassigned from the server-global monotonic counter
 	// (srv.nextEspEpochLocked) on every request that touches the pair's
-	// ESP state (prepare, activate, abandon, destructive replace,
-	// plaintext strip) and on teardown (see dropIpipPeerLocked). The
+	// ESP state (prepare, activate, abandon, destructive replace) and on
+	// teardown (see dropIpipPeerLocked). The
 	// background GC/reap goroutines capture the epoch and abort once it no
 	// longer matches. Because the counter is process-global, an epoch can
 	// never repeat -- not even on a re-created peer struct for the same
@@ -75,8 +75,8 @@ type ipipPeer struct {
 
 type connectIpipResponse struct {
 	AssignedAddr string
-	// Esp is present only when the request asked for it; old clients see
-	// exactly the pre-ESP response shape.
+	// Esp carries the minted key material on setup and PREPARE responses;
+	// ACTIVATE and ABANDON responses carry only AssignedAddr.
 	Esp *connectIpipEspResponse `json:",omitempty"`
 }
 
@@ -176,8 +176,10 @@ const (
 const (
 	ipipRestoreReasonNotIptun        = "not an iptun device"
 	ipipRestoreReasonUnusableRemote  = "missing or unusable remote"
+	ipipRestoreReasonWrongLocal      = "wrong local endpoint"
 	ipipRestoreReasonDuplicateRemote = "duplicate remote"
 	ipipRestoreReasonClaimFailed     = "inner IP already claimed or outside prefix"
+	ipipRestoreReasonRepairFailed    = "adopted iface repair failed"
 )
 
 // ipipRestoreCandidate is one leftover iface after name/type/remote
@@ -208,9 +210,13 @@ func usableIpipRemote(remote net.IP) (netip.Addr, bool) {
 }
 
 // classifyIpipLink decides whether a leftover iface is ours to ignore, adopt,
-// or delete, based only on name parseability, link type, and Remote.
-// Duplicate Remote and Claim failures are applied later by planIpipRestore.
-func classifyIpipLink(ifname string, isIptun bool, remote net.IP, parse func(string) (netip.Addr, bool)) ipipRestoreCandidate {
+// or delete, based only on name parseability, link type, Local, and Remote.
+// A wrong (or missing) local endpoint is an invalid leftover: the pair's
+// ESP objects and the client's tunnel config are keyed by the outer
+// address pair, so an iface whose Local is not this server's bind address
+// can never carry the peer's traffic and must not be published. Duplicate
+// Remote and Claim failures are applied later by planIpipRestore.
+func classifyIpipLink(ifname string, isIptun bool, local, remote net.IP, wantLocal netip.Addr, parse func(string) (netip.Addr, bool)) ipipRestoreCandidate {
 	peerIP, ok := parse(ifname)
 	if !ok {
 		return ipipRestoreCandidate{Ifname: ifname, Kind: ipipRestoreIgnore}
@@ -219,6 +225,11 @@ func classifyIpipLink(ifname string, isIptun bool, remote net.IP, parse func(str
 	if !isIptun {
 		c.Kind = ipipRestoreDelete
 		c.Reason = ipipRestoreReasonNotIptun
+		return c
+	}
+	if localAddr, ok := usableIpipRemote(local); !ok || localAddr != wantLocal {
+		c.Kind = ipipRestoreDelete
+		c.Reason = ipipRestoreReasonWrongLocal
 		return c
 	}
 	addr, ok := usableIpipRemote(remote)
@@ -305,15 +316,38 @@ func (srv *Server) RestoreIpipFromKernel() error {
 	classified := make([]ipipRestoreCandidate, 0, len(links))
 	for _, link := range links {
 		tun, isIptun := link.(*netlink.Iptun)
-		var remote net.IP
+		var local, remote net.IP
 		if isIptun {
-			remote = tun.Remote
+			local, remote = tun.Local, tun.Remote
 		}
 		classified = append(classified, classifyIpipLink(
-			link.Attrs().Name, isIptun, remote, srv.ipipPeerFromIfname))
+			link.Attrs().Name, isIptun, local, remote, srv.BindAddr, srv.ipipPeerFromIfname))
 	}
 
 	adopt, del := planIpipRestore(classified, srv.ipAllocator.Claim)
+
+	// Reconcile each would-adopt iface with the dataplane it is supposed
+	// to provide BEFORE publishing it: the link must be up and the peer's
+	// /32 host route must exist (a previous life may have died between
+	// LinkAdd and RouteReplace, or an operator may have downed the link).
+	// Both repairs are cheap and idempotent. An iface that cannot be
+	// repaired is demoted to an invalid leftover: publishing it would
+	// blackhole the peer's return traffic while claiming the pair is
+	// healthy. Demoted ifaces release their allocator claim once the
+	// teardown below confirms the iface gone.
+	repaired := adopt[:0]
+	for _, c := range adopt {
+		if err := srv.repairAdoptedIpipLink(c.Ifname, c.PeerIP); err != nil {
+			log.Printf("[%v] adopted ipip iface %s (peer %v) failed reconciliation: %v; demoting to invalid leftover",
+				srv.BindAddr, c.Ifname, c.PeerIP, err)
+			c.Kind = ipipRestoreDelete
+			c.Reason = ipipRestoreReasonRepairFailed
+			del = append(del, c)
+			continue
+		}
+		repaired = append(repaired, c)
+	}
+	adopt = repaired
 
 	now := time.Now()
 	srv.ipipMu.Lock()
@@ -347,6 +381,11 @@ func (srv *Server) RestoreIpipFromKernel() error {
 		if err := srv.tearDownIpipLink(c.Ifname, c.PeerIP); err != nil {
 			return fmt.Errorf("tear down invalid ipip leftover %s: %v", c.Ifname, err)
 		}
+		// A repair-failed candidate had already won its allocator claim as
+		// a would-adopt; the iface is now confirmed gone, so release it.
+		if c.Reason == ipipRestoreReasonRepairFailed {
+			srv.ipAllocator.Free(c.PeerIP)
+		}
 		// Adopted pairs keep their kernel xfrm untouched (the SAs keep
 		// encrypting across the restart); deleted leftovers lose theirs.
 		// ESP state is keyed by the address pair, so a leftover whose
@@ -365,6 +404,50 @@ func (srv *Server) RestoreIpipFromKernel() error {
 			log.Printf("[%v] failed to remove esp for deleted ipip leftover %s (client %v): %v",
 				srv.BindAddr, c.Ifname, c.Remote, err)
 		}
+	}
+	return nil
+}
+
+// repairAdoptedIpipLink verifies (and cheaply repairs) the dataplane of an
+// iface about to be adopted: the link must be UP and the peer's /32 host
+// route must point at it. Both fixes are in-place and idempotent
+// (LinkSetUp on an up link and RouteReplace of an identical route are
+// no-ops). Any error means the iface could not be brought to a publishable
+// state; the caller demotes it to an invalid leftover.
+func (srv *Server) repairAdoptedIpipLink(ifname string, peerIP netip.Addr) error {
+	link, err := netlink.LinkByName(ifname)
+	if err != nil {
+		return fmt.Errorf("lookup %s: %v", ifname, err)
+	}
+	if link.Attrs().Flags&net.FlagUp == 0 {
+		if err := netlink.LinkSetUp(link); err != nil {
+			return fmt.Errorf("bring up %s: %v", ifname, err)
+		}
+		log.Printf("[%v] adopted ipip iface %s was down; brought up", srv.BindAddr, ifname)
+	}
+	dst := prefixToIPNet(netip.PrefixFrom(peerIP, 32))
+	routes, err := netlink.RouteList(link, netlinkFamilyV4)
+	if err != nil {
+		return fmt.Errorf("list routes on %s: %v", ifname, err)
+	}
+	present := false
+	for i := range routes {
+		if routes[i].Dst != nil && routes[i].Dst.String() == dst.String() {
+			present = true
+			break
+		}
+	}
+	if !present {
+		route := &netlink.Route{
+			LinkIndex: link.Attrs().Index,
+			Dst:       &dst,
+			Scope:     netlinkScopeLink,
+		}
+		if err := netlink.RouteReplace(route); err != nil {
+			return fmt.Errorf("restore /32 route for %v via %s: %v", peerIP, ifname, err)
+		}
+		log.Printf("[%v] adopted ipip iface %s was missing the %v/32 route; restored",
+			srv.BindAddr, ifname, peerIP)
 	}
 	return nil
 }
@@ -474,8 +557,9 @@ func (srv *Server) lookupOrCreateIpip(clientIP netip.Addr, req connectIpipReques
 // installs a new generation without emitting on it; ACTIVATE flips the
 // outbound policy to it; ABANDON walks a failed rotation back without
 // deleting any active state (see the package comment in ipip_esp.go).
-// Plaintext removes any leftover ESP state so an old client gets exactly
-// today's behavior instead of a require-ESP policy blackholing it.
+// Plaintext requests never reach here: ESP is mandatory and validate()
+// rejects them at the handler with a 400, before any peer is looked up
+// or created. (The old {}-strips-ESP rollback path is gone with it.)
 //
 // Every branch bumps espRekeyEpoch first, so any in-flight GC/reap
 // goroutine from a previous request aborts instead of touching state that
@@ -486,16 +570,6 @@ func (srv *Server) finishIpipConnectLocked(p *ipipPeer, req connectIpipRequest) 
 	}
 
 	p.espRekeyEpoch = srv.nextEspEpochLocked()
-
-	if !req.Esp {
-		if err := srv.removeIpipEsp(p.clientIP); err != nil {
-			log.Printf("[%v] esp remove FAILED for plaintext ipip peer %v (%s): %v",
-				srv.BindAddr, p.clientIP, p.ifname, err)
-			return nil, "failed to remove stale ESP state", http.StatusInternalServerError
-		}
-		p.clearEspGenerations()
-		return resp, "", 0
-	}
 
 	if req.Activate != "" {
 		spi, _ := parseIpipEspSpiHex(req.Activate) // validated by the handler
@@ -555,8 +629,8 @@ func (srv *Server) finishIpipConnectLocked(p *ipipPeer, req connectIpipRequest) 
 	return resp, "", 0
 }
 
-// clearEspGenerations resets every per-generation field (plaintext strip,
-// teardown bookkeeping).
+// clearEspGenerations resets every per-generation field (destructive
+// full install, teardown bookkeeping).
 func (p *ipipPeer) clearEspGenerations() {
 	p.espSpiToServer, p.espSpiToClient = 0, 0
 	p.espPendingSpiToServer, p.espPendingSpiToClient = 0, 0

@@ -141,34 +141,51 @@ func TestUsableIpipRemote(t *testing.T) {
 }
 
 func TestClassifyIpipLink(t *testing.T) {
-	srv := &Server{Index: 0, WgCidr: testWgCidr("10.100.0.0/16")}
+	srv := &Server{
+		Index:    0,
+		WgCidr:   testWgCidr("10.100.0.0/16"),
+		BindAddr: netip.MustParseAddr("198.51.100.1"),
+	}
 	parse := srv.ipipPeerFromIfname
+	local := addrToIp(srv.BindAddr)
 	remote := net.ParseIP("203.0.113.9")
 
-	ignored := classifyIpipLink("eth0", false, nil, parse)
+	ignored := classifyIpipLink("eth0", false, nil, nil, srv.BindAddr, parse)
 	assert.Equal(t, ipipRestoreIgnore, ignored.Kind)
 
-	ignored = classifyIpipLink("vp1-1", true, remote, parse)
+	ignored = classifyIpipLink("vp1-1", true, local, remote, srv.BindAddr, parse)
 	assert.Equal(t, ipipRestoreIgnore, ignored.Kind)
 
-	notTun := classifyIpipLink("vp0-1", false, remote, parse)
+	notTun := classifyIpipLink("vp0-1", false, local, remote, srv.BindAddr, parse)
 	assert.Equal(t, ipipRestoreDelete, notTun.Kind)
 	assert.Equal(t, ipipRestoreReasonNotIptun, notTun.Reason)
 	assert.Equal(t, netip.MustParseAddr("10.100.0.2"), notTun.PeerIP)
 
-	noRemote := classifyIpipLink("vp0-1", true, nil, parse)
+	noRemote := classifyIpipLink("vp0-1", true, local, nil, srv.BindAddr, parse)
 	assert.Equal(t, ipipRestoreDelete, noRemote.Kind)
 	assert.Equal(t, ipipRestoreReasonUnusableRemote, noRemote.Reason)
 
-	unspec := classifyIpipLink("vp0-1", true, net.IPv4zero, parse)
+	unspec := classifyIpipLink("vp0-1", true, local, net.IPv4zero, srv.BindAddr, parse)
 	assert.Equal(t, ipipRestoreDelete, unspec.Kind)
 	assert.Equal(t, ipipRestoreReasonUnusableRemote, unspec.Reason)
 
-	v6 := classifyIpipLink("vp0-1", true, net.ParseIP("2001:db8::1"), parse)
+	v6 := classifyIpipLink("vp0-1", true, local, net.ParseIP("2001:db8::1"), srv.BindAddr, parse)
 	assert.Equal(t, ipipRestoreDelete, v6.Kind)
 	assert.Equal(t, ipipRestoreReasonUnusableRemote, v6.Reason)
 
-	adopt := classifyIpipLink("vp0-1", true, remote, parse)
+	// Wrong or missing LOCAL endpoint: the pair's ESP objects and the
+	// peer's tunnel config key on the outer address pair, so an iface
+	// whose Local is not this server's bind address is an invalid
+	// leftover regardless of its Remote.
+	wrongLocal := classifyIpipLink("vp0-1", true, net.ParseIP("198.51.100.2"), remote, srv.BindAddr, parse)
+	assert.Equal(t, ipipRestoreDelete, wrongLocal.Kind)
+	assert.Equal(t, ipipRestoreReasonWrongLocal, wrongLocal.Reason)
+
+	noLocal := classifyIpipLink("vp0-1", true, nil, remote, srv.BindAddr, parse)
+	assert.Equal(t, ipipRestoreDelete, noLocal.Kind)
+	assert.Equal(t, ipipRestoreReasonWrongLocal, noLocal.Reason)
+
+	adopt := classifyIpipLink("vp0-1", true, local, remote, srv.BindAddr, parse)
 	assert.Equal(t, ipipRestoreAdopt, adopt.Kind)
 	assert.Equal(t, "vp0-1", adopt.Ifname)
 	assert.Equal(t, netip.MustParseAddr("10.100.0.2"), adopt.PeerIP)
@@ -179,15 +196,31 @@ func TestClassifyIpipLink(t *testing.T) {
 // is reserved so vp0-1 is the first peer IP (10.100.0.2).
 func testIpipRestoreServer() *Server {
 	cidr := testWgCidr("10.100.0.0/16")
-	srv := &Server{Index: 0, WgCidr: cidr, ipAllocator: NewIpAllocator(cidr)}
+	srv := &Server{
+		Index:       0,
+		WgCidr:      cidr,
+		BindAddr:    netip.MustParseAddr("198.51.100.1"),
+		ipAllocator: NewIpAllocator(cidr),
+	}
 	_ = srv.ipAllocator.Allocate()
 	return srv
 }
 
+// classifyRestoreLink classifies with the server's own bind address as the
+// candidate's Local, the way a healthy leftover looks to
+// RestoreIpipFromKernel.
+func classifyRestoreLink(srv *Server, ifname string, isIptun bool, remote net.IP) ipipRestoreCandidate {
+	var local net.IP
+	if isIptun {
+		local = addrToIp(srv.BindAddr)
+	}
+	return classifyIpipLink(ifname, isIptun, local, remote, srv.BindAddr, srv.ipipPeerFromIfname)
+}
+
 func TestPlanIpipRestoreAdoptsValidTunnels(t *testing.T) {
 	srv := testIpipRestoreServer()
-	a := classifyIpipLink("vp0-1", true, net.ParseIP("203.0.113.1"), srv.ipipPeerFromIfname)
-	b := classifyIpipLink("vp0-2", true, net.ParseIP("203.0.113.2"), srv.ipipPeerFromIfname)
+	a := classifyRestoreLink(srv, "vp0-1", true, net.ParseIP("203.0.113.1"))
+	b := classifyRestoreLink(srv, "vp0-2", true, net.ParseIP("203.0.113.2"))
 	adopt, del := planIpipRestore([]ipipRestoreCandidate{a, b}, srv.ipAllocator.Claim)
 	require.Len(t, adopt, 2)
 	assert.Empty(t, del)
@@ -199,8 +232,8 @@ func TestPlanIpipRestoreAdoptsValidTunnels(t *testing.T) {
 
 func TestPlanIpipRestoreDeletesDuplicateRemote(t *testing.T) {
 	srv := testIpipRestoreServer()
-	first := classifyIpipLink("vp0-1", true, net.ParseIP("203.0.113.1"), srv.ipipPeerFromIfname)
-	dup := classifyIpipLink("vp0-2", true, net.ParseIP("203.0.113.1"), srv.ipipPeerFromIfname)
+	first := classifyRestoreLink(srv, "vp0-1", true, net.ParseIP("203.0.113.1"))
+	dup := classifyRestoreLink(srv, "vp0-2", true, net.ParseIP("203.0.113.1"))
 	adopt, del := planIpipRestore([]ipipRestoreCandidate{first, dup}, srv.ipAllocator.Claim)
 	require.Len(t, adopt, 1)
 	assert.Equal(t, "vp0-1", adopt[0].Ifname)
@@ -216,7 +249,7 @@ func TestPlanIpipRestoreDeletesDuplicateRemote(t *testing.T) {
 func TestPlanIpipRestoreDeletesWhenWGOwnsInnerIP(t *testing.T) {
 	srv := testIpipRestoreServer()
 	require.True(t, srv.ipAllocator.Claim(netip.MustParseAddr("10.100.0.2")))
-	c := classifyIpipLink("vp0-1", true, net.ParseIP("203.0.113.1"), srv.ipipPeerFromIfname)
+	c := classifyRestoreLink(srv, "vp0-1", true, net.ParseIP("203.0.113.1"))
 	adopt, del := planIpipRestore([]ipipRestoreCandidate{c}, srv.ipAllocator.Claim)
 	assert.Empty(t, adopt)
 	require.Len(t, del, 1)
@@ -225,8 +258,8 @@ func TestPlanIpipRestoreDeletesWhenWGOwnsInnerIP(t *testing.T) {
 
 func TestPlanIpipRestoreDeletesDuplicateInnerIP(t *testing.T) {
 	srv := testIpipRestoreServer()
-	a := classifyIpipLink("vp0-1", true, net.ParseIP("203.0.113.1"), srv.ipipPeerFromIfname)
-	b := classifyIpipLink("vp0-01", true, net.ParseIP("203.0.113.2"), srv.ipipPeerFromIfname)
+	a := classifyRestoreLink(srv, "vp0-1", true, net.ParseIP("203.0.113.1"))
+	b := classifyRestoreLink(srv, "vp0-01", true, net.ParseIP("203.0.113.2"))
 	adopt, del := planIpipRestore([]ipipRestoreCandidate{a, b}, srv.ipAllocator.Claim)
 	require.Len(t, adopt, 1)
 	assert.Equal(t, "vp0-1", adopt[0].Ifname)
@@ -238,8 +271,8 @@ func TestPlanIpipRestoreDeletesDuplicateInnerIP(t *testing.T) {
 func TestPlanIpipRestoreSecondRemoteAdoptedIfFirstClaimFails(t *testing.T) {
 	srv := testIpipRestoreServer()
 	require.True(t, srv.ipAllocator.Claim(netip.MustParseAddr("10.100.0.2")))
-	first := classifyIpipLink("vp0-1", true, net.ParseIP("203.0.113.1"), srv.ipipPeerFromIfname)
-	second := classifyIpipLink("vp0-2", true, net.ParseIP("203.0.113.1"), srv.ipipPeerFromIfname)
+	first := classifyRestoreLink(srv, "vp0-1", true, net.ParseIP("203.0.113.1"))
+	second := classifyRestoreLink(srv, "vp0-2", true, net.ParseIP("203.0.113.1"))
 	adopt, del := planIpipRestore([]ipipRestoreCandidate{first, second}, srv.ipAllocator.Claim)
 	require.Len(t, adopt, 1)
 	assert.Equal(t, "vp0-2", adopt[0].Ifname)
@@ -250,9 +283,14 @@ func TestPlanIpipRestoreSecondRemoteAdoptedIfFirstClaimFails(t *testing.T) {
 
 func TestPlanIpipRestoreDeletesOutsidePrefix(t *testing.T) {
 	cidr := testWgCidr("10.100.0.0/30")
-	srv := &Server{Index: 0, WgCidr: cidr, ipAllocator: NewIpAllocator(cidr)}
+	srv := &Server{
+		Index:       0,
+		WgCidr:      cidr,
+		BindAddr:    netip.MustParseAddr("198.51.100.1"),
+		ipAllocator: NewIpAllocator(cidr),
+	}
 	_ = srv.ipAllocator.Allocate()
-	c := classifyIpipLink("vp0-5", true, net.ParseIP("203.0.113.1"), srv.ipipPeerFromIfname)
+	c := classifyRestoreLink(srv, "vp0-5", true, net.ParseIP("203.0.113.1"))
 	assert.Equal(t, ipipRestoreAdopt, c.Kind)
 	adopt, del := planIpipRestore([]ipipRestoreCandidate{c}, srv.ipAllocator.Claim)
 	assert.Empty(t, adopt)
@@ -262,9 +300,9 @@ func TestPlanIpipRestoreDeletesOutsidePrefix(t *testing.T) {
 
 func TestPlanIpipRestoreIgnoresUnrelatedAndDeletesClassifiedOrphans(t *testing.T) {
 	srv := testIpipRestoreServer()
-	ignore := classifyIpipLink("eth0", false, nil, srv.ipipPeerFromIfname)
-	orphan := classifyIpipLink("vp0-1", false, nil, srv.ipipPeerFromIfname)
-	good := classifyIpipLink("vp0-2", true, net.ParseIP("203.0.113.2"), srv.ipipPeerFromIfname)
+	ignore := classifyRestoreLink(srv, "eth0", false, nil)
+	orphan := classifyRestoreLink(srv, "vp0-1", false, nil)
+	good := classifyRestoreLink(srv, "vp0-2", true, net.ParseIP("203.0.113.2"))
 	adopt, del := planIpipRestore([]ipipRestoreCandidate{ignore, orphan, good}, srv.ipAllocator.Claim)
 	require.Len(t, adopt, 1)
 	assert.Equal(t, "vp0-2", adopt[0].Ifname)
@@ -279,9 +317,9 @@ func TestPlanIpipRestoreIgnoresUnrelatedAndDeletesClassifiedOrphans(t *testing.T
 // tunnel, so its Remote must be in the protected set.
 func TestIpipAdoptedRemotes(t *testing.T) {
 	srv := testIpipRestoreServer()
-	adopted := classifyIpipLink("vp0-1", true, net.ParseIP("203.0.113.1"), srv.ipipPeerFromIfname)
-	dup := classifyIpipLink("vp0-2", true, net.ParseIP("203.0.113.1"), srv.ipipPeerFromIfname)
-	orphan := classifyIpipLink("vp0-3", false, nil, srv.ipipPeerFromIfname)
+	adopted := classifyRestoreLink(srv, "vp0-1", true, net.ParseIP("203.0.113.1"))
+	dup := classifyRestoreLink(srv, "vp0-2", true, net.ParseIP("203.0.113.1"))
+	orphan := classifyRestoreLink(srv, "vp0-3", false, nil)
 
 	adopt, del := planIpipRestore([]ipipRestoreCandidate{adopted, dup, orphan}, srv.ipAllocator.Claim)
 	require.Len(t, adopt, 1)
@@ -308,10 +346,10 @@ func TestIpipAdoptedRemotes(t *testing.T) {
 func TestIpipAdoptedRemotesDistinctRemoteNotProtected(t *testing.T) {
 	srv := testIpipRestoreServer()
 	require.True(t, srv.ipAllocator.Claim(netip.MustParseAddr("10.100.0.3")))
-	adopted := classifyIpipLink("vp0-1", true, net.ParseIP("203.0.113.1"), srv.ipipPeerFromIfname)
+	adopted := classifyRestoreLink(srv, "vp0-1", true, net.ParseIP("203.0.113.1"))
 	// Claim for vp0-2 (10.100.0.3) fails, so it is deleted, but its Remote
 	// differs from every adopted tunnel's.
-	loser := classifyIpipLink("vp0-2", true, net.ParseIP("203.0.113.2"), srv.ipipPeerFromIfname)
+	loser := classifyRestoreLink(srv, "vp0-2", true, net.ParseIP("203.0.113.2"))
 
 	adopt, del := planIpipRestore([]ipipRestoreCandidate{adopted, loser}, srv.ipAllocator.Claim)
 	require.Len(t, adopt, 1)

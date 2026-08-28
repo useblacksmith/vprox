@@ -13,13 +13,16 @@ import (
 
 // ESP for IPIP tunnels.
 //
-// The IPIP outer path (client <-> srv.BindAddr, IP proto 4) is plaintext by
-// default. A client may opt in to ESP by sending {"esp": true} in the
-// /connect-ipip body; the server then mints one SA per direction (SPI +
-// AES-GCM key), installs kernel xfrm state and a require-ESP policy for the
-// proto-4 traffic between the two hosts, and returns the key material in the
-// response. The response rides the same TLS channel that already carries the
-// bearer password, so no extra key-exchange protocol (IKE, DH) is needed.
+// ESP is MANDATORY on the IPIP outer path (client <-> srv.BindAddr, IP
+// proto 4): every /connect-ipip body must carry {"esp": true}, and a
+// plaintext body ({} or esp:false) is rejected with a 400 before any state
+// is touched. There is no plaintext fallback -- /connect-ipip has never
+// carried production traffic, so the endpoint goes live encrypted-only.
+// On connect the server mints one SA per direction (SPI + keys), installs
+// kernel xfrm state and a require-ESP policy for the proto-4 traffic
+// between the two hosts, and returns the key material in the response.
+// The response rides the same TLS channel that already carries the bearer
+// password, so no extra key-exchange protocol (IKE, DH) is needed.
 //
 // Rekey. The SAs have no lifetimes and no ESN (macOS setkey cannot install
 // ESN), so a non-ESN SA hard-stops at seq 2^32; clients must rotate SA
@@ -48,6 +51,20 @@ import (
 //	         If N+1 was activated, the outbound policy is flipped back to
 //	         the previous generation's reqid; the abandoned states stay
 //	         installed until the next successful rotation's GC sweeps them.
+//
+// An ACTIVATE is PROVISIONAL until the client proves it: if no packet
+// arrives on the new generation's inbound SA before the activation gate
+// expires (ipipEspActivationGate), the server flips the outbound policy
+// back to the previous generation's reqid on its own -- so a client whose
+// ABANDON never arrived (crashed helper, dropped connection) is not left
+// receiving on a generation it never finished installing. The auto-revert
+// and ABANDON are mutually idempotent: both are epoch-guarded and verify
+// the kernel policy still selects the activated generation before
+// reverting, so whichever runs second is a no-op.
+//
+// Rekey mutations are version-gated (see ipipEspRekeyVersion): requests
+// with "rekey" must carry the matching "espRekeyV" or they are rejected
+// before touching any state.
 //
 // GC is gated on dataplane evidence, never wall clock alone: after an
 // ACTIVATE, a background poll watches the new inbound SA's packet counter
@@ -154,23 +171,48 @@ func mintIpipEspSpi() (uint32, error) {
 	}
 }
 
-// connectIpipRequest is the (optional) JSON body of POST /connect-ipip.
-// Old clients send an empty body or {} and get plaintext IPIP. Rekey asks
-// for an additive SA-generation PREPARE instead of a destructive replace;
-// Activate and Abandon are the follow-up steps of the forward-only
-// rotation, each carrying the target generation's SpiToClient as lowercase
-// hex (see the package comment). All three are only meaningful with Esp.
+// ipipEspRekeyVersion is the explicit protocol version every rekey
+// MUTATION (PREPARE-as-rekey, ACTIVATE, ABANDON) must carry as
+// "espRekeyV". The forward-only protocol's failure handling assumes both
+// sides implement the same walk-back semantics (activation auto-revert,
+// idempotent abandon, target-state switch); silently serving an agent that
+// speaks an earlier draft of the protocol risks kernel-state divergence
+// that only shows up on a mature tunnel. Versionless or mismatched rekey
+// mutations are rejected with a 4xx. Fresh connects ({"esp":true} without
+// rekey) are deliberately exempt: pre-rekey agents never send rekey
+// mutations at all, so the only supported skew (old agent <-> new server)
+// is unaffected. (Genuinely pre-ESP agents fail earlier: their plaintext
+// bodies are rejected by the mandatory-ESP check in validate.)
+const ipipEspRekeyVersion = 2
+
+// connectIpipRequest is the JSON body of POST /connect-ipip. ESP is
+// MANDATORY on the IPIP path: a plaintext body (empty, {}, or esp:false)
+// is rejected with a 400 before any state is touched. There are no
+// deployed plaintext IPIP clients to stay compatible with -- production
+// vproxes have never served /connect-ipip, so the endpoint goes live
+// encrypted-only. Rekey asks for an additive SA-generation PREPARE
+// instead of a destructive replace; Activate and Abandon are the
+// follow-up steps of the forward-only rotation, each carrying the target
+// generation's SpiToClient as lowercase hex (see the package comment).
+// Every request with Rekey must carry EspRekeyV (see ipipEspRekeyVersion).
 type connectIpipRequest struct {
-	Esp      bool   `json:"esp"`
-	Rekey    bool   `json:"rekey"`
-	Activate string `json:"activate,omitempty"`
-	Abandon  string `json:"abandon,omitempty"`
+	Esp       bool   `json:"esp"`
+	Rekey     bool   `json:"rekey"`
+	EspRekeyV int    `json:"espRekeyV,omitempty"`
+	Activate  string `json:"activate,omitempty"`
+	Abandon   string `json:"abandon,omitempty"`
 }
 
-// validate rejects request combinations that have no defined semantics.
+// validate rejects request combinations that have no defined semantics,
+// and enforces mandatory ESP: plaintext IPIP is not a supported state.
 func (r connectIpipRequest) validate() error {
-	if r.Rekey && !r.Esp {
-		return fmt.Errorf("rekey requires esp")
+	if !r.Esp {
+		return fmt.Errorf("ESP required: plaintext IPIP is not supported on /connect-ipip")
+	}
+	if r.Rekey && r.EspRekeyV != ipipEspRekeyVersion {
+		return fmt.Errorf(
+			"unsupported ESP rekey protocol version %d (server speaks espRekeyV %d); the agent and server must be deployed from matching protocol revisions",
+			r.EspRekeyV, ipipEspRekeyVersion)
 	}
 	if (r.Activate != "" || r.Abandon != "") && !(r.Esp && r.Rekey) {
 		return fmt.Errorf("activate/abandon require esp and rekey")
@@ -274,8 +316,10 @@ func ipipEspFinishInstall(finish, unwind func() error) (err, unwindErr error) {
 // legitimate body is a few bytes of JSON.
 const ipipRequestBodyLimit = 4096
 
-// parseConnectIpipRequest decodes the /connect-ipip body. An empty body is
-// valid (old clients) and yields the zero request.
+// parseConnectIpipRequest decodes the /connect-ipip body. An empty body
+// parses to the zero request, which validate() then rejects (ESP is
+// mandatory); parse and validate are kept separate so the 400 carries the
+// "ESP required" message rather than a JSON error.
 func parseConnectIpipRequest(body io.Reader) (connectIpipRequest, error) {
 	var req connectIpipRequest
 	data, err := io.ReadAll(io.LimitReader(body, ipipRequestBodyLimit))

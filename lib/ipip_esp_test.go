@@ -41,9 +41,12 @@ func TestParseConnectIpipRequest(t *testing.T) {
 		esp   bool
 		rekey bool
 	}{
-		{"empty body (old client)", "", false, false},
+		// Plaintext shapes still PARSE (so validate can return the
+		// actionable "ESP required" 400 instead of a JSON error), but
+		// they no longer pass validate -- ESP is mandatory.
+		{"empty body (pre-ESP client, rejected by validate)", "", false, false},
 		{"whitespace body", "  \n", false, false},
-		{"empty object (old client)", "{}", false, false},
+		{"empty object (pre-ESP client, rejected by validate)", "{}", false, false},
 		{"esp false", `{"esp": false}`, false, false},
 		{"esp true", `{"esp": true}`, true, false},
 		{"esp rekey", `{"esp": true, "rekey": true}`, true, true},
@@ -60,24 +63,57 @@ func TestParseConnectIpipRequest(t *testing.T) {
 }
 
 func TestConnectIpipRequestValidate(t *testing.T) {
-	assert.NoError(t, connectIpipRequest{}.validate())
+	v := ipipEspRekeyVersion
 	assert.NoError(t, connectIpipRequest{Esp: true}.validate())
-	assert.NoError(t, connectIpipRequest{Esp: true, Rekey: true}.validate())
-	assert.Error(t, connectIpipRequest{Rekey: true}.validate(),
-		"rekey without esp has no defined semantics")
+	assert.NoError(t, connectIpipRequest{Esp: true, Rekey: true, EspRekeyV: v}.validate())
 
-	assert.NoError(t, connectIpipRequest{Esp: true, Rekey: true, Activate: "c0ffee42"}.validate())
-	assert.NoError(t, connectIpipRequest{Esp: true, Rekey: true, Abandon: "c0ffee42"}.validate())
+	// ESP is mandatory: a plaintext body ({} or esp:false) is rejected with
+	// an actionable "ESP required" message before any state is touched.
+	err := connectIpipRequest{}.validate()
+	require.Error(t, err, "plaintext {} rejected: ESP is mandatory")
+	assert.Contains(t, err.Error(), "ESP required")
+	assert.Error(t, connectIpipRequest{Rekey: true, EspRekeyV: v}.validate(),
+		"rekey without esp rejected (plaintext, and no defined semantics)")
+
+	assert.NoError(t, connectIpipRequest{Esp: true, Rekey: true, EspRekeyV: v, Activate: "c0ffee42"}.validate())
+	assert.NoError(t, connectIpipRequest{Esp: true, Rekey: true, EspRekeyV: v, Abandon: "c0ffee42"}.validate())
 	assert.Error(t, connectIpipRequest{Esp: true, Activate: "c0ffee42"}.validate(),
 		"activate requires rekey")
-	assert.Error(t, connectIpipRequest{Esp: true, Rekey: true, Activate: "a", Abandon: "b"}.validate(),
+	assert.Error(t, connectIpipRequest{Esp: true, Rekey: true, EspRekeyV: v, Activate: "a", Abandon: "b"}.validate(),
 		"activate and abandon are mutually exclusive")
-	assert.Error(t, connectIpipRequest{Esp: true, Rekey: true, Activate: "zzzz"}.validate(),
+	assert.Error(t, connectIpipRequest{Esp: true, Rekey: true, EspRekeyV: v, Activate: "zzzz"}.validate(),
 		"non-hex SPI rejected")
-	assert.Error(t, connectIpipRequest{Esp: true, Rekey: true, Activate: "0"}.validate(),
+	assert.Error(t, connectIpipRequest{Esp: true, Rekey: true, EspRekeyV: v, Activate: "0"}.validate(),
 		"zero SPI rejected")
-	assert.Error(t, connectIpipRequest{Esp: true, Rekey: true, Activate: "100000000"}.validate(),
+	assert.Error(t, connectIpipRequest{Esp: true, Rekey: true, EspRekeyV: v, Activate: "100000000"}.validate(),
 		"SPI wider than 32 bits rejected")
+}
+
+// TestConnectIpipRequestVersionGate pins the espRekeyV contract: every
+// rekey mutation must carry the exact protocol version; fresh ESP connects
+// are exempt (pre-rekey agents never send rekey). Plaintext requests fail
+// the mandatory-ESP check before the version gate is even consulted.
+func TestConnectIpipRequestVersionGate(t *testing.T) {
+	assert.Error(t, connectIpipRequest{Esp: true, Rekey: true}.validate(),
+		"versionless rekey mutation rejected")
+	assert.Error(t, connectIpipRequest{Esp: true, Rekey: true, EspRekeyV: 1}.validate(),
+		"old-draft version rejected")
+	assert.Error(t, connectIpipRequest{Esp: true, Rekey: true, EspRekeyV: ipipEspRekeyVersion + 1}.validate(),
+		"future version rejected")
+	assert.Error(t, connectIpipRequest{Esp: true, Rekey: true, EspRekeyV: 1, Activate: "c0ffee42"}.validate(),
+		"activate with wrong version rejected")
+	assert.Error(t, connectIpipRequest{Esp: true, Rekey: true, Abandon: "c0ffee42"}.validate(),
+		"versionless abandon rejected")
+	assert.NoError(t, connectIpipRequest{Esp: true}.validate(),
+		"fresh ESP connect is exempt")
+	assert.Error(t, connectIpipRequest{}.validate(),
+		"plaintext request rejected by the mandatory-ESP check")
+
+	// The version gate produces a message that names both versions so the
+	// 4xx is actionable from the client's log alone.
+	err := connectIpipRequest{Esp: true, Rekey: true}.validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "espRekeyV 2")
 }
 
 func TestParseIpipEspSpiHex(t *testing.T) {
@@ -234,10 +270,12 @@ func TestParseConnectIpipRequestRejectsGarbage(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// TestConnectIpipResponsePlaintextShapeUnchanged pins the compat contract:
-// a response without ESP marshals exactly like the pre-ESP server's, so old
-// clients (and new clients talking plaintext) see no new fields.
-func TestConnectIpipResponsePlaintextShapeUnchanged(t *testing.T) {
+// TestConnectIpipResponseBareShape pins the shape of responses that carry
+// no key material (ACTIVATE and ABANDON): exactly the one AssignedAddr
+// field, no Esp key. Plaintext responses no longer exist -- ESP is
+// mandatory -- but the bare shape is still on the wire for those two
+// rotation steps.
+func TestConnectIpipResponseBareShape(t *testing.T) {
 	buf, err := json.Marshal(&connectIpipResponse{AssignedAddr: "10.100.0.2/16"})
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"AssignedAddr": "10.100.0.2/16"}`, string(buf))
