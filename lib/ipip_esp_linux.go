@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"net/netip"
 	"os"
@@ -75,7 +76,19 @@ func ipipEspGcGrace() time.Duration {
 // SA and the template, and the whole point of the rotation protocol is
 // that EVERY installed inbound generation stays acceptable at once.
 func ipipEspReqid(spiToClient uint32) int {
-	return int(spiToClient)
+	return spiToInt(spiToClient)
+}
+
+// spiToInt converts a 32-bit SPI to the int fields netlink uses (Spi,
+// Reqid). SPIs are minted across the full uint32 range, so on a 32-bit
+// platform roughly half of them would not fit in int and would silently
+// go negative in netlink structs. vprox only builds for 64-bit Linux;
+// this guard makes that assumption explicit instead of truncating.
+func spiToInt(spi uint32) int {
+	if uint64(spi) > uint64(math.MaxInt) {
+		panic(fmt.Sprintf("ESP SPI 0x%x exceeds int range: 32-bit builds are unsupported", spi))
+	}
+	return int(spi)
 }
 
 // ipipEspXfrmState builds one transport-mode ESP xfrm state.
@@ -85,7 +98,7 @@ func ipipEspXfrmState(src, dst netip.Addr, sa ipipEspSA, reqid int) *netlink.Xfr
 		Dst:          addrToIp(dst),
 		Proto:        netlink.XFRM_PROTO_ESP,
 		Mode:         netlink.XFRM_MODE_TRANSPORT,
-		Spi:          int(sa.Spi),
+		Spi:          spiToInt(sa.Spi),
 		Reqid:        reqid,
 		ReplayWindow: 32,
 		Crypt: &netlink.XfrmStateAlgo{
@@ -421,7 +434,7 @@ func (srv *Server) deleteIpipEspStateBySpi(src, dst netip.Addr, spi uint32) {
 		Src:   addrToIp(src),
 		Dst:   addrToIp(dst),
 		Proto: netlink.XFRM_PROTO_ESP,
-		Spi:   int(spi),
+		Spi:   spiToInt(spi),
 	}
 	if err := netlink.XfrmStateDel(st); err != nil && !xfrmNotFound(err) {
 		log.Printf("[%v] failed to delete esp state %v->%v spi 0x%x: %v",
@@ -479,7 +492,7 @@ func (srv *Server) activateIpipEsp(p *ipipPeer, target, expectedActive uint32) (
 		Src:   addrToIp(srv.BindAddr),
 		Dst:   addrToIp(p.clientIP),
 		Proto: netlink.XFRM_PROTO_ESP,
-		Spi:   int(target),
+		Spi:   spiToInt(target),
 	}); err != nil {
 		if xfrmNotFound(err) {
 			return ipipActivateConflict, uint32(curReqid), fmt.Errorf("no prepared to-client state with spi 0x%x", target)
@@ -714,7 +727,7 @@ func (srv *Server) ipipEspStateAbsent(src, dst netip.Addr, spi uint32) bool {
 		Src:   addrToIp(src),
 		Dst:   addrToIp(dst),
 		Proto: netlink.XFRM_PROTO_ESP,
-		Spi:   int(spi),
+		Spi:   spiToInt(spi),
 	})
 	return err != nil && xfrmNotFound(err)
 }
