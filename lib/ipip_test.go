@@ -273,6 +273,63 @@ func TestPlanIpipRestoreIgnoresUnrelatedAndDeletesClassifiedOrphans(t *testing.T
 	assert.Equal(t, ipipRestoreReasonNotIptun, del[0].Reason)
 }
 
+// TestIpipAdoptedRemotes verifies the ESP-protection set used by restore
+// teardown: a rejected duplicate-remote leftover shares its (server,
+// client) pair -- and therefore its kernel ESP state -- with the adopted
+// tunnel, so its Remote must be in the protected set.
+func TestIpipAdoptedRemotes(t *testing.T) {
+	srv := testIpipRestoreServer()
+	adopted := classifyIpipLink("vp0-1", true, net.ParseIP("203.0.113.1"), srv.ipipPeerFromIfname)
+	dup := classifyIpipLink("vp0-2", true, net.ParseIP("203.0.113.1"), srv.ipipPeerFromIfname)
+	orphan := classifyIpipLink("vp0-3", false, nil, srv.ipipPeerFromIfname)
+
+	adopt, del := planIpipRestore([]ipipRestoreCandidate{adopted, dup, orphan}, srv.ipAllocator.Claim)
+	require.Len(t, adopt, 1)
+	require.Len(t, del, 2)
+
+	remotes := ipipAdoptedRemotes(adopt)
+	require.Len(t, remotes, 1)
+
+	for _, d := range del {
+		_, owned := remotes[d.Remote]
+		switch d.Reason {
+		case ipipRestoreReasonDuplicateRemote:
+			assert.True(t, owned,
+				"duplicate remote shares the adopted pair's ESP state and must be protected")
+		case ipipRestoreReasonNotIptun:
+			assert.False(t, owned, "orphan without usable remote is not protected")
+		}
+	}
+}
+
+// TestIpipAdoptedRemotesDistinctRemoteNotProtected: a deleted leftover with
+// its own (non-adopted) Remote keeps today's behavior -- its ESP state is
+// removed.
+func TestIpipAdoptedRemotesDistinctRemoteNotProtected(t *testing.T) {
+	srv := testIpipRestoreServer()
+	require.True(t, srv.ipAllocator.Claim(netip.MustParseAddr("10.100.0.3")))
+	adopted := classifyIpipLink("vp0-1", true, net.ParseIP("203.0.113.1"), srv.ipipPeerFromIfname)
+	// Claim for vp0-2 (10.100.0.3) fails, so it is deleted, but its Remote
+	// differs from every adopted tunnel's.
+	loser := classifyIpipLink("vp0-2", true, net.ParseIP("203.0.113.2"), srv.ipipPeerFromIfname)
+
+	adopt, del := planIpipRestore([]ipipRestoreCandidate{adopted, loser}, srv.ipAllocator.Claim)
+	require.Len(t, adopt, 1)
+	require.Len(t, del, 1)
+
+	remotes := ipipAdoptedRemotes(adopt)
+	_, owned := remotes[del[0].Remote]
+	assert.False(t, owned, "a delete with its own remote must not be ESP-protected")
+	_, owned = remotes[netip.MustParseAddr("203.0.113.1")]
+	assert.True(t, owned)
+}
+
+func TestIpipAdoptedRemotesEmpty(t *testing.T) {
+	assert.Empty(t, ipipAdoptedRemotes(nil))
+	assert.Empty(t, ipipAdoptedRemotes([]ipipRestoreCandidate{{Ifname: "vp0-1"}}),
+		"zero Remote must not enter the set")
+}
+
 // TestIpipLinkNotFound is the teardown/Free gate: only LinkNotFound means
 // the kernel object is gone and the inner IP may be Freed. nil (iface still
 // present) and any other lookup error must not Free.

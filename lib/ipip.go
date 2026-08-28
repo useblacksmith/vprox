@@ -246,6 +246,24 @@ func planIpipRestore(candidates []ipipRestoreCandidate, claim func(netip.Addr) b
 	return adopt, del
 }
 
+// ipipAdoptedRemotes returns the set of outer client addresses owned by
+// adopted restore candidates. ESP kernel objects (SAs and require-ESP
+// policies) are keyed by the (server, client) ADDRESS PAIR, not by iface,
+// so a rejected leftover that shares its Remote with an adopted tunnel --
+// the duplicate-remote case -- shares that tunnel's live ESP state too.
+// Teardown of such a leftover must skip pair-level ESP removal, or the
+// adopted tunnel silently loses its SAs/policies while it is carrying
+// traffic.
+func ipipAdoptedRemotes(adopt []ipipRestoreCandidate) map[netip.Addr]struct{} {
+	remotes := make(map[netip.Addr]struct{}, len(adopt))
+	for _, c := range adopt {
+		if c.Remote.IsValid() {
+			remotes[c.Remote] = struct{}{}
+		}
+	}
+	return remotes
+}
+
 // RestoreIpipFromKernel adopts leftover IPIP tunnels into Go state and
 // deletes only invalid leftovers. Analogous to RestorePeersFromKernel: the
 // kernel dataplane keeps forwarding across deploys, and Mac clients cache
@@ -303,6 +321,7 @@ func (srv *Server) RestoreIpipFromKernel() error {
 		}
 	}
 
+	adoptedRemotes := ipipAdoptedRemotes(adopt)
 	for _, c := range del {
 		log.Printf("[%v] removing invalid leftover ipip iface %s (peer %v): %s",
 			srv.BindAddr, c.Ifname, c.PeerIP, c.Reason)
@@ -311,11 +330,21 @@ func (srv *Server) RestoreIpipFromKernel() error {
 		}
 		// Adopted pairs keep their kernel xfrm untouched (the SAs keep
 		// encrypting across the restart); deleted leftovers lose theirs.
-		if c.Remote.IsValid() {
-			if err := srv.removeIpipEsp(c.Remote); err != nil {
-				log.Printf("[%v] failed to remove esp for deleted ipip leftover %s (client %v): %v",
-					srv.BindAddr, c.Ifname, c.Remote, err)
-			}
+		// ESP state is keyed by the address pair, so a leftover whose
+		// Remote is owned by an adopted tunnel (duplicate remote) shares
+		// the adopted tunnel's LIVE SAs/policies -- removing them here
+		// would strip the adopted tunnel's encryption mid-flight.
+		if !c.Remote.IsValid() {
+			continue
+		}
+		if _, owned := adoptedRemotes[c.Remote]; owned {
+			log.Printf("[%v] keeping esp for remote %v: deleted leftover %s shares it with an adopted tunnel",
+				srv.BindAddr, c.Remote, c.Ifname)
+			continue
+		}
+		if err := srv.removeIpipEsp(c.Remote); err != nil {
+			log.Printf("[%v] failed to remove esp for deleted ipip leftover %s (client %v): %v",
+				srv.BindAddr, c.Ifname, c.Remote, err)
 		}
 	}
 	return nil
