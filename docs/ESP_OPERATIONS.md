@@ -80,25 +80,42 @@ should die loudly, not wobble.
 When a tunnel cannot rotate — a rotation convicted DEAD twice within one
 recovery budget, the sequence-headroom audit crossing 2^31
 (`BLACKSMITH_STATIC_IP_SEQ_TERMINAL_THRESHOLD` overrides for tests) while
-rotation is blocked, or vprox reporting the pair rebuilt (`Fresh`) — the
-Mac agent runs the TERMINAL procedure:
+rotation is blocked, headroom staying UNPROVABLE (counter reads failing)
+continuously past `BLACKSMITH_STATIC_IP_HEADROOM_UNKNOWN_WINDOW` (default
+6 h), or vprox reporting the pair rebuilt (`Fresh`) — the Mac agent runs
+the TERMINAL procedure. Every teardown of an entry that still has holder
+VMs funnels through the same procedure (including a cached tunnel probed
+DEAD and a quarantined entry being retried); raw teardown is only legal
+at zero holders.
 
-1. stop admissions on the tunnel entry;
+1. stop admissions on the tunnel entry and drain ATTACHING holders (VMs
+   whose setup is still in flight: their setup revalidates the entry
+   before committing PF rules and again before VM start, so a fenced
+   entry fails their setup with a retryable error and the job requeues);
 2. join the tunnel actor (join timeout ⇒ quarantine; nothing is destroyed
    while the owner may still run);
-3. install per-VM **PF drop guards** for the exact holder set and kill
-   their pf states, VERIFYING the drops took effect **before** the gif is
-   destroyed. This is fail-closed by construction: the per-VM `route-to`
-   rule is stateful and the baseline mac policy broadly allows VM
-   internet, so without guards a destroyed gif would let VM traffic egress
-   `en0` under the mini's own source IP — an allowlist-contract violation
-   worse than the outage. If a guard cannot be verified, the entry is
-   quarantined with the gif intact instead.
-4. terminate every holder VM through the VM-stop machinery with the
-   distinct `StaticIPTunnelLost{VMID, JobID, VproxIP}` reason;
-5. tear down (gif destroyed + verified absent, IPsec flushed, entry
+3. install **PF drop guards** for the exact holder set and kill their pf
+   states, VERIFYING the drops took effect **before** the gif is
+   destroyed. Live holders get TWO copies: one in a TERMINAL-owned anchor
+   (`blacksmith-sip/term-<vmid>`) that per-VM cleanup never touches, and
+   one replacing the per-VM anchor's rules in place. This is fail-closed
+   by construction: the per-VM `route-to` rule is stateful and the
+   baseline mac policy broadly allows VM internet, so without guards a
+   destroyed gif would let VM traffic egress `en0` under the mini's own
+   source IP — an allowlist-contract violation worse than the outage. If
+   a guard cannot be verified, the entry is quarantined with the gif
+   intact instead.
+4. terminate every live holder VM through the VM-stop machinery with the
+   distinct `StaticIPTunnelLost{VMID, JobID, VproxIP}` reason (StopVM
+   errors are NOT success);
+5. CONFIRM each holder VM's death (bounded poll of the VM object's state
+   / manager ownership). A holder's terminal-owned guard is removed only
+   after THAT holder is confirmed gone; any unconfirmed holder ⇒
+   quarantine with all guards intact. The next acquisition resumes the
+   procedure idempotently (guards may already exist; re-verify, continue);
+6. tear down (gif destroyed + verified absent, IPsec flushed, entry
    removed); the next acquisition builds fresh;
-6. emit `blacksmith_vm_static_ip_terminal` (reason + vprox_server_ip) and
+7. emit `blacksmith_vm_static_ip_terminal` (reason + vprox_server_ip) and
    `blacksmith_vm_static_ip_terminal_jobs`.
 
 **Product decision (approved, do not regress): jobs terminated by a
@@ -204,4 +221,6 @@ Related invariants the code maintains (do not regress):
   of adopted pairs — including when it deletes a rejected leftover iface
   that shares its remote with an adopted tunnel.
 * PF fail-closed before gif destruction: any teardown path where VMs may
-  still reference the gif installs and verifies per-VM drop guards first.
+  still reference the gif installs and verifies drop guards first (for
+  live holders, in a TERMINAL-owned anchor that survives per-VM cleanup),
+  and destroys nothing until every holder's death is confirmed.
