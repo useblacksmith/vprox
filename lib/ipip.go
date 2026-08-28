@@ -693,14 +693,36 @@ func (srv *Server) createIpipLink(ifname string, remote, peerIP netip.Addr) erro
 	return nil
 }
 
-// tearDownIpipLink removes the per-peer iptables filter and the IPIP
-// interface. The interface is the source of truth: LinkNotFound is success
-// (already gone), any other lookup or LinkDel error is returned so the
-// caller does not Free the inner IP or drop the map entry. Filter removal
-// is best-effort; a surviving iface is not treated as torn down.
+// tearDownIpipLink removes the IPIP interface and then the per-peer
+// iptables filters. The interface is the source of truth: LinkNotFound is
+// success (already gone), any other lookup or LinkDel error is returned so
+// the caller does not Free the inner IP or drop the map entry. Filter
+// removal is best-effort; a surviving iface is not treated as torn down.
 func (srv *Server) tearDownIpipLink(ifname string, peerIP netip.Addr) error {
-	srv.removeIpipPeerFilter(ifname, peerIP)
+	return tearDownIpipSequence(
+		func() error { return srv.deleteIpipLink(ifname) },
+		func() { srv.removeIpipPeerFilter(ifname, peerIP) },
+	)
+}
 
+// tearDownIpipSequence deletes the kernel link first and removes the
+// per-peer FORWARD filters only once the link is confirmed gone. The order
+// matters: the filters are the inner-source spoof protection for a live
+// interface, so if the delete fails and the tunnel survives, its filters
+// must survive with it -- removing them first would leave a live tunnel
+// forwarding without spoof protection. deleteLink's contract is to return
+// nil only when the link is confirmed absent.
+func tearDownIpipSequence(deleteLink func() error, removeFilters func()) error {
+	if err := deleteLink(); err != nil {
+		return err
+	}
+	removeFilters()
+	return nil
+}
+
+// deleteIpipLink removes the named IPIP interface. Returns nil only when
+// the link is confirmed gone (deleted now, or LinkNotFound).
+func (srv *Server) deleteIpipLink(ifname string) error {
 	link, err := netlink.LinkByName(ifname)
 	if err != nil {
 		if ipipLinkNotFound(err) {
@@ -751,10 +773,10 @@ func (srv *Server) addIpipPeerFilter(ifname string, peerIP netip.Addr) error {
 }
 
 func (srv *Server) removeIpipPeerFilter(ifname string, peerIP netip.Addr) {
-	// The interface is about to be deleted (or already is), so removal
-	// order doesn't matter for security; either rule alone matches
-	// nothing once the interface is gone. Use DeleteIfExists so a
-	// partially-installed filter (e.g. failed mid-add) cleans up
+	// The interface is confirmed gone by the time this runs (see
+	// tearDownIpipSequence), so either rule alone matches nothing and
+	// removal order between the two doesn't matter. Use DeleteIfExists
+	// so a partially-installed filter (e.g. failed mid-add) cleans up
 	// without a noisy "rule does not exist" error.
 	if err := srv.Ipt.DeleteIfExists("filter", "FORWARD", ipipPeerDropRule(ifname)...); err != nil {
 		log.Printf("[%v] failed to remove ipip drop rule for %s: %v",

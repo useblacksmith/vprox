@@ -330,6 +330,43 @@ func TestIpipAdoptedRemotesEmpty(t *testing.T) {
 		"zero Remote must not enter the set")
 }
 
+// TestTearDownIpipSequenceOrder locks in the teardown order contract: the
+// per-peer FORWARD filters (spoof protection) are removed only after the
+// link delete confirms the iface is gone. A failed delete means a live
+// tunnel may remain, and it must keep its filters.
+func TestTearDownIpipSequenceOrder(t *testing.T) {
+	t.Run("delete failure keeps filters", func(t *testing.T) {
+		filtersRemoved := false
+		err := tearDownIpipSequence(
+			func() error { return fmt.Errorf("link busy") },
+			func() { filtersRemoved = true },
+		)
+		require.Error(t, err, "caller must not Free the inner IP")
+		assert.False(t, filtersRemoved,
+			"filters must survive when the link may still exist")
+	})
+
+	t.Run("delete success removes filters", func(t *testing.T) {
+		filtersRemoved := false
+		err := tearDownIpipSequence(
+			func() error { return nil },
+			func() { filtersRemoved = true },
+		)
+		require.NoError(t, err)
+		assert.True(t, filtersRemoved)
+	})
+
+	t.Run("filters removed after delete, not before", func(t *testing.T) {
+		var order []string
+		err := tearDownIpipSequence(
+			func() error { order = append(order, "delete"); return nil },
+			func() { order = append(order, "filters") },
+		)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"delete", "filters"}, order)
+	})
+}
+
 // TestIpipLinkNotFound is the teardown/Free gate: only LinkNotFound means
 // the kernel object is gone and the inner IP may be Freed. nil (iface still
 // present) and any other lookup error must not Free.
