@@ -9,20 +9,19 @@ import (
 	"io"
 	"net/netip"
 	"strconv"
+	"sync/atomic"
+	"time"
 )
 
 // ESP for IPIP tunnels.
 //
 // ESP is MANDATORY on the IPIP outer path (client <-> srv.BindAddr, IP
-// proto 4): every /connect-ipip body must carry {"esp": true}, and a
-// plaintext body ({} or esp:false) is rejected with a 400 before any state
-// is touched. There is no plaintext fallback -- /connect-ipip has never
-// carried production traffic, so the endpoint goes live encrypted-only.
-// On connect the server mints one SA per direction (SPI + keys), installs
-// kernel xfrm state and a require-ESP policy for the proto-4 traffic
-// between the two hosts, and returns the key material in the response.
-// The response rides the same TLS channel that already carries the bearer
-// password, so no extra key-exchange protocol (IKE, DH) is needed.
+// proto 4). On connect the server mints one SA per direction (SPI + keys),
+// installs kernel xfrm state and a require-ESP policy for the proto-4
+// traffic between the two hosts, and returns the key material in the
+// response. The response rides the same TLS channel that already carries
+// the bearer password, so no extra key-exchange protocol (IKE, DH) is
+// needed.
 //
 // Rekey. The SAs have no lifetimes and no ESN (macOS setkey cannot install
 // ESN), so a non-ESN SA hard-stops at seq 2^32; clients must rotate SA
@@ -30,60 +29,54 @@ import (
 // deleted and re-added (re-adding an outbound SA resets its sequence
 // counter to zero while the peer's inbound anti-replay high-water mark
 // survives, so every packet on the re-added SA is dropped as a replay on a
-// mature tunnel). The client drives a three-step rotation:
+// mature tunnel), and a rotation NEVER walks backward -- there is no
+// abandon, no revert, no rollback. A failed rotation either retries
+// forward with a fresh generation or, after the client's single recovery
+// budget is spent, terminates the tunnel entirely (the client owns that
+// terminal procedure; see the FA agent).
 //
-//	PREPARE  {"esp":true,"rekey":true}: mint generation N+1, install BOTH
-//	         its states -- the new inbound (client->server, reqid 0 like
-//	         every inbound) and the new outbound (server->client) under a
-//	         fresh reqid -- WITHOUT flipping the outbound policy. The
-//	         kernel keeps emitting generation N (xfrm policy templates
-//	         select states by exact reqid match), and every old state is
+// The wire protocol is /connect-ipip v1, explicit op (see
+// connectIpipRequest):
+//
+//	{"version":1,"op":"connect"}  mint a fresh generation and DESTRUCTIVELY
+//	         replace whatever the kernel holds for the pair (fresh-connect
+//	         semantics; the client is building a new tunnel).
+//	{"version":1,"op":"prepare"}  mint generation N+1 and install BOTH its
+//	         states -- the new inbound (client->server, reqid 0 like every
+//	         inbound) and the new outbound (server->client) under a fresh
+//	         reqid -- WITHOUT flipping the outbound policy. The kernel
+//	         keeps emitting generation N (xfrm policy templates select
+//	         states by exact reqid match), and every old state is
 //	         untouched. The minted material is returned to the client.
-//	ACTIVATE {"esp":true,"rekey":true,"activate":"<SpiToClient hex>"}:
-//	         after the client has installed its inbound for N+1, flip the
-//	         outbound policy template to N+1's reqid. The old outbound
-//	         STATE is retained, so the flip is reversible without replay
-//	         damage (Linux resumes the old state's sequence counter).
-//	         Idempotent, keyed by the generation's SpiToClient.
-//	ABANDON  {"esp":true,"rekey":true,"abandon":"<SpiToClient hex>"}:
-//	         the client's on-the-wire proof of N+1 failed. If N+1 is still
-//	         pending, its two states are deleted (nothing else changes).
-//	         If N+1 was activated, the outbound policy is flipped back to
-//	         the previous generation's reqid; the abandoned states stay
-//	         installed until the next successful rotation's GC sweeps them.
+//	{"version":1,"op":"activate","target":"<hex>","expectedActive":"<hex>"}
+//	         flip the outbound policy to target's reqid, FENCED by a
+//	         compare-and-swap on the kernel policy: the flip happens only
+//	         if the policy currently selects expectedActive's generation.
+//	         A delayed or replayed activate for a superseded generation
+//	         fails with 409 and mutates NOTHING. Activating the already-
+//	         active target is idempotent success. The old outbound STATE
+//	         is retained (the housekeeper GC's it later on dataplane
+//	         evidence), so an unproven flip never destroys the old path.
 //
-// An ACTIVATE is PROVISIONAL until the client proves it: if no packet
-// arrives on the new generation's inbound SA before the activation gate
-// expires (ipipEspActivationGate), the server flips the outbound policy
-// back to the previous generation's reqid on its own -- so a client whose
-// ABANDON never arrived (crashed helper, dropped connection) is not left
-// receiving on a generation it never finished installing. The auto-revert
-// and ABANDON are mutually idempotent: both are epoch-guarded and verify
-// the kernel policy still selects the activated generation before
-// reverting, so whichever runs second is a no-op.
+// Missing/unknown version or op is rejected with 400 BEFORE any peer
+// lookup or mutation; an empty body can never imply a destructive install.
 //
-// Rekey mutations are version-gated (see ipipEspRekeyVersion): requests
-// with "rekey" must carry the matching "espRekeyV" or they are rejected
-// before touching any state.
+// There are no request flags: ESP is implied (connect and prepare always
+// return minted keys) and there is no rekey/esp boolean, no espRekeyV
+// version gate (the versioned op IS the gate), and no abandon op.
 //
-// GC is gated on dataplane evidence, never wall clock alone: after an
-// ACTIVATE, a background poll watches the new inbound SA's packet counter
-// (the client's post-switch health check produces those packets); only
-// once it ticks -- proof the client transmits on N+1 -- are the pair's
-// other generations swept, after a grace period. On poll timeout nothing
-// is deleted; the next successful rotation's sweep collects stragglers. A
-// pending generation the client never activates is reaped after a timeout
-// (or replaced by the next PREPARE) without touching active state.
-//
-// A plain {"esp": true} (no rekey) keeps the original destructive-replace
-// semantics for fresh connects: delete every SA for the pair, install one
-// new generation. A PREPARE for a pair with no live server->client SA
-// falls back to that same full install and reports Fresh=true so the
-// client knows the pair was rebuilt rather than rotated.
+// Failure handling is owned by ONE housekeeping sweep (see
+// ipipHousekeepingLoop), not per-request goroutines: prepared-but-never-
+// activated generations are reaped after a deadline, superseded
+// generations are GC'd only after the counter-gated proof that the client
+// transmits on the new generation plus a grace period, and vanished peers
+// are reaped as before. Nothing in the sweep ever touches the active
+// generation, a pending generation within its deadline, or anything a
+// transition still references.
 
 // ipipEspAlgorithm is the transform used for IPIP ESP, as a wire-protocol
 // name shared with the Mac client: AES-128-CBC encryption with
-// HMAC-SHA-256 authentication truncated to 96 bits. AES-GCM would be
+// HMAC-SHA-256 authentication truncated to 128 bits. AES-GCM would be
 // preferable (one key, AEAD), but macOS setkey's PF_KEY grammar has no
 // AEAD tokens at all (verified on macOS 26: "syntax error at [aes-gcm]"),
 // so CBC+HMAC is the strongest transform both kernels can install.
@@ -171,68 +164,62 @@ func mintIpipEspSpi() (uint32, error) {
 	}
 }
 
-// ipipEspRekeyVersion is the explicit protocol version every rekey
-// MUTATION (PREPARE-as-rekey, ACTIVATE, ABANDON) must carry as
-// "espRekeyV". The forward-only protocol's failure handling assumes both
-// sides implement the same walk-back semantics (activation auto-revert,
-// idempotent abandon, target-state switch); silently serving an agent that
-// speaks an earlier draft of the protocol risks kernel-state divergence
-// that only shows up on a mature tunnel. Versionless or mismatched rekey
-// mutations are rejected with a 4xx. Fresh connects ({"esp":true} without
-// rekey) are deliberately exempt: pre-rekey agents never send rekey
-// mutations at all, so the only supported skew (old agent <-> new server)
-// is unaffected. (Genuinely pre-ESP agents fail earlier: their plaintext
-// bodies are rejected by the mandatory-ESP check in validate.)
-const ipipEspRekeyVersion = 2
+// ipipWireVersion is the /connect-ipip protocol version. Requests whose
+// version does not match are rejected with 400 before any peer lookup:
+// the two sides of the rotation protocol must be deployed from matching
+// revisions, and the explicit version on every request is what enforces
+// that mechanically.
+const ipipWireVersion = 1
 
-// connectIpipRequest is the JSON body of POST /connect-ipip. ESP is
-// MANDATORY on the IPIP path: a plaintext body (empty, {}, or esp:false)
-// is rejected with a 400 before any state is touched. There are no
-// deployed plaintext IPIP clients to stay compatible with -- production
-// vproxes have never served /connect-ipip, so the endpoint goes live
-// encrypted-only. Rekey asks for an additive SA-generation PREPARE
-// instead of a destructive replace; Activate and Abandon are the
-// follow-up steps of the forward-only rotation, each carrying the target
-// generation's SpiToClient as lowercase hex (see the package comment).
-// Every request with Rekey must carry EspRekeyV (see ipipEspRekeyVersion).
+// /connect-ipip ops.
+const (
+	ipipOpConnect  = "connect"
+	ipipOpPrepare  = "prepare"
+	ipipOpActivate = "activate"
+)
+
+// connectIpipRequest is the JSON body of POST /connect-ipip. Version and
+// Op are mandatory: a missing/unknown version or op -- including the
+// empty body -- is rejected with 400 before any peer lookup or mutation,
+// so no request shape can ever imply a destructive install by accident.
+// Target and ExpectedActive (lowercase hex SpiToClient values) are
+// required by op=activate and forbidden elsewhere; ExpectedActive is the
+// activate fence (see the package comment).
 type connectIpipRequest struct {
-	Esp       bool   `json:"esp"`
-	Rekey     bool   `json:"rekey"`
-	EspRekeyV int    `json:"espRekeyV,omitempty"`
-	Activate  string `json:"activate,omitempty"`
-	Abandon   string `json:"abandon,omitempty"`
+	Version        int    `json:"version"`
+	Op             string `json:"op"`
+	Target         string `json:"target,omitempty"`
+	ExpectedActive string `json:"expectedActive,omitempty"`
 }
 
-// validate rejects request combinations that have no defined semantics,
-// and enforces mandatory ESP: plaintext IPIP is not a supported state.
+// validate enforces the wire gate. It runs in the handler BEFORE the peer
+// map is consulted or any kernel object is touched.
 func (r connectIpipRequest) validate() error {
-	if !r.Esp {
-		return fmt.Errorf("ESP required: plaintext IPIP is not supported on /connect-ipip")
+	if r.Version != ipipWireVersion {
+		return fmt.Errorf("unsupported /connect-ipip version %d (server speaks version %d); deploy matching revisions", r.Version, ipipWireVersion)
 	}
-	if r.Rekey && r.EspRekeyV != ipipEspRekeyVersion {
-		return fmt.Errorf(
-			"unsupported ESP rekey protocol version %d (server speaks espRekeyV %d); the agent and server must be deployed from matching protocol revisions",
-			r.EspRekeyV, ipipEspRekeyVersion)
-	}
-	if (r.Activate != "" || r.Abandon != "") && !(r.Esp && r.Rekey) {
-		return fmt.Errorf("activate/abandon require esp and rekey")
-	}
-	if r.Activate != "" && r.Abandon != "" {
-		return fmt.Errorf("activate and abandon are mutually exclusive")
-	}
-	for _, s := range []string{r.Activate, r.Abandon} {
-		if s == "" {
-			continue
+	switch r.Op {
+	case ipipOpConnect, ipipOpPrepare:
+		if r.Target != "" || r.ExpectedActive != "" {
+			return fmt.Errorf("op %q takes no target/expectedActive", r.Op)
 		}
-		if _, err := parseIpipEspSpiHex(s); err != nil {
-			return err
+	case ipipOpActivate:
+		if _, err := parseIpipEspSpiHex(r.Target); err != nil {
+			return fmt.Errorf("activate requires a valid target: %v", err)
 		}
+		if _, err := parseIpipEspSpiHex(r.ExpectedActive); err != nil {
+			return fmt.Errorf("activate requires a valid expectedActive: %v", err)
+		}
+	case "":
+		return fmt.Errorf("missing op (want connect|prepare|activate)")
+	default:
+		return fmt.Errorf("unknown op %q (want connect|prepare|activate)", r.Op)
 	}
 	return nil
 }
 
 // parseIpipEspSpiHex parses a generation's SpiToClient as sent by the
-// client in activate/abandon requests.
+// client in activate requests.
 func parseIpipEspSpiHex(s string) (uint32, error) {
 	v, err := strconv.ParseUint(s, 16, 32)
 	if err != nil || v == 0 {
@@ -242,11 +229,11 @@ func parseIpipEspSpiHex(s string) (uint32, error) {
 }
 
 // ipipEspStateKey identifies one kernel ESP state by direction, SPI, and
-// reqid. The rekey and GC paths work on these instead of full xfrm states
-// so the selection logic is pure and testable off-Linux. AddTime is the
-// kernel's install timestamp (seconds), used to pick the newest existing
-// generation when healing a lost outbound policy; it survives vprox
-// restarts because it lives in the kernel, not in this process.
+// reqid. The sweep works on these instead of full xfrm states so the
+// selection logic is pure and testable off-Linux. AddTime is the kernel's
+// install timestamp (seconds since install), used to age orphan states;
+// it survives vprox restarts because it lives in the kernel, not in this
+// process.
 type ipipEspStateKey struct {
 	Src     netip.Addr
 	Dst     netip.Addr
@@ -255,46 +242,32 @@ type ipipEspStateKey struct {
 	AddTime uint64
 }
 
+// ipipEspStateInfo is a state key plus the kernel packet counter, the
+// dataplane evidence the sweep's GC gate keys on.
+type ipipEspStateInfo struct {
+	ipipEspStateKey
+	Packets uint64
+}
+
 // newestIpipEspToClientReqid returns the reqid of the newest (by kernel
-// AddTime) server->client state other than excludeSpi. Used only to heal a
-// missing outbound policy: the policy template must select the generation
-// the pair was actually running on, and after a vprox restart the only
-// source of truth is the kernel. Legacy states (installed before reqid'd
-// generations) carry reqid 0, which is exactly the template value that
-// selects them. ok is false when the pair has no such state.
-func newestIpipEspToClientReqid(states []ipipEspStateKey, server, client netip.Addr, excludeSpi uint32) (reqid int, ok bool) {
+// AddTime, which counts seconds SINCE install -- smaller is newer) server->
+// client state other than excludeSpi. Used only to heal a missing outbound
+// policy: the policy template must select the generation the pair was
+// actually running on, and after a vprox restart the only source of truth
+// is the kernel. ok is false when the pair has no such state.
+func newestIpipEspToClientReqid(states []ipipEspStateInfo, server, client netip.Addr, excludeSpi uint32) (reqid int, ok bool) {
 	var best ipipEspStateKey
 	found := false
 	for _, s := range states {
 		if s.Src != server || s.Dst != client || s.Spi == excludeSpi {
 			continue
 		}
-		if !found || s.AddTime > best.AddTime {
-			best = s
+		if !found || s.AddTime < best.AddTime {
+			best = s.ipipEspStateKey
 			found = true
 		}
 	}
 	return best.Reqid, found
-}
-
-// ipipEspStatesToDelete returns the states flowing src->dst whose SPI is
-// not in keep. States for other address pairs (or the reverse direction)
-// are never selected. The rekey outbound switch uses it with the new
-// generation's SPI as the only keeper; GC uses it per direction with the
-// current generation pair, which also sweeps generations orphaned by a
-// restart that lost the in-memory bookkeeping.
-func ipipEspStatesToDelete(states []ipipEspStateKey, src, dst netip.Addr, keep map[uint32]struct{}) []ipipEspStateKey {
-	var victims []ipipEspStateKey
-	for _, s := range states {
-		if s.Src != src || s.Dst != dst {
-			continue
-		}
-		if _, keepIt := keep[s.Spi]; keepIt {
-			continue
-		}
-		victims = append(victims, s)
-	}
-	return victims
 }
 
 // ipipEspFinishInstall runs finish (the post-xfrm steps of an ESP install:
@@ -313,13 +286,13 @@ func ipipEspFinishInstall(finish, unwind func() error) (err, unwindErr error) {
 }
 
 // ipipRequestBodyLimit bounds how much of the request body we read; the
-// legitimate body is a few bytes of JSON.
+// legitimate body is a few dozen bytes of JSON.
 const ipipRequestBodyLimit = 4096
 
 // parseConnectIpipRequest decodes the /connect-ipip body. An empty body
-// parses to the zero request, which validate() then rejects (ESP is
-// mandatory); parse and validate are kept separate so the 400 carries the
-// "ESP required" message rather than a JSON error.
+// parses to the zero request, which validate() then rejects (missing
+// version and op); parse and validate are kept separate so the 400 names
+// the protocol violation rather than a JSON error.
 func parseConnectIpipRequest(body io.Reader) (connectIpipRequest, error) {
 	var req connectIpipRequest
 	data, err := io.ReadAll(io.LimitReader(body, ipipRequestBodyLimit))
@@ -333,4 +306,152 @@ func parseConnectIpipRequest(body io.Reader) (connectIpipRequest, error) {
 		return req, fmt.Errorf("parse request body: %v", err)
 	}
 	return req, nil
+}
+
+// ipipSweepHealth tracks the housekeeping sweep's pass/error counters and
+// last success for the log-based health lines.
+type ipipSweepHealth struct {
+	passes      atomic.Uint64
+	errors      atomic.Uint64
+	lastSuccess atomic.Int64 // unix seconds
+	lastLogged  atomic.Int64 // unix seconds
+}
+
+// Housekeeping sweep planning (pure; the Linux half feeds kernel dumps in
+// and applies the plan out, see sweepIpipEsp).
+
+// espSweepPeerInput is one peer's transition bookkeeping plus the kernel
+// truth the sweep needs to decide what to reap.
+type espSweepPeerInput struct {
+	Server, Client netip.Addr
+
+	// Kernel truth: the outbound policy's template reqid IS the active
+	// generation (states are selected by exact reqid match).
+	PolicyReqid int
+	PolicyFound bool
+
+	// Bookkept transition data (plain fields on the peer).
+	ActiveSpiToServer  uint32 // 0 = unknown (adopted pair, restart)
+	PendingSpiToServer uint32
+	PendingSpiToClient uint32
+	PreparedAt         time.Time
+	ActivatedAt        time.Time
+
+	Now             time.Time
+	PendingDeadline time.Duration
+	GcGrace         time.Duration
+
+	// States for THIS pair only (both directions), with counters.
+	States []ipipEspStateInfo
+}
+
+// espSweepPlan is the sweep's decision for one peer: which pending
+// bookkeeping to clear and which exact states to delete. Failed deletions
+// stay retryable next pass (the planner re-derives the same plan from
+// kernel truth).
+type espSweepPlan struct {
+	ReapPending bool
+	Deletions   []ipipEspStateKey
+}
+
+// planEspSweep decides, from kernel truth plus the peer's plain transition
+// fields, which ESP states are reapable. The invariants, in order of
+// precedence:
+//
+//   - The ACTIVE generation is never touched: the outbound state the
+//     policy's reqid selects, and the bookkept active inbound.
+//   - A pending generation within its deadline is never touched; past the
+//     deadline its two states are reaped exactly (the client walked away
+//     without activating -- there is no abandon op to tell us sooner).
+//   - Superseded/orphan OUTBOUND states (not policy-selected, not pending)
+//     are deleted only after the switch is confirmed on the wire -- the
+//     active inbound's packet counter is nonzero, proof the client
+//     transmits on the new generation -- plus a grace period since the
+//     activate. Orphans with no transition bookkeeping at all (restart
+//     leftovers) age out on the kernel's own AddTime instead.
+//   - INBOUND states other than the active/pending ones are deleted under
+//     the same counter gate; when the active inbound is UNKNOWN (adopted
+//     pair before its first post-restart rotation) no inbound is ever
+//     deleted -- we cannot know which one the client transmits on.
+//   - A missing outbound policy makes the pair ambiguous: nothing but the
+//     pending reap may run (the next prepare heals the policy).
+//   - A counter that cannot be read is UNKNOWN, not zero: the active
+//     inbound state missing from the dump skips the gate entirely.
+func planEspSweep(in espSweepPeerInput) espSweepPlan {
+	var plan espSweepPlan
+
+	pendingSet := in.PendingSpiToServer != 0 || in.PendingSpiToClient != 0
+	pendingExpired := pendingSet && !in.PreparedAt.IsZero() &&
+		in.Now.Sub(in.PreparedAt) > in.PendingDeadline
+	if pendingExpired {
+		plan.ReapPending = true
+		for _, s := range in.States {
+			if (s.Src == in.Client && s.Dst == in.Server && s.Spi == in.PendingSpiToServer) ||
+				(s.Src == in.Server && s.Dst == in.Client && s.Spi == in.PendingSpiToClient) {
+				plan.Deletions = append(plan.Deletions, s.ipipEspStateKey)
+			}
+		}
+	}
+
+	if !in.PolicyFound {
+		return plan
+	}
+
+	// Counter gate: the active inbound must exist in the dump and show
+	// packets. Missing state = UNKNOWN, gate stays closed.
+	counterConfirmed := false
+	if in.ActiveSpiToServer != 0 {
+		for _, s := range in.States {
+			if s.Src == in.Client && s.Dst == in.Server && s.Spi == in.ActiveSpiToServer {
+				counterConfirmed = s.Packets > 0
+				break
+			}
+		}
+	}
+	graceElapsed := !in.ActivatedAt.IsZero() && in.Now.Sub(in.ActivatedAt) > in.GcGrace
+	gcOpen := counterConfirmed && graceElapsed
+
+	pendingLive := pendingSet && !pendingExpired
+
+	for _, s := range in.States {
+		switch {
+		case s.Src == in.Server && s.Dst == in.Client: // outbound
+			if s.Reqid == in.PolicyReqid {
+				continue // active generation
+			}
+			if pendingLive && s.Spi == in.PendingSpiToClient {
+				continue
+			}
+			if pendingExpired && s.Spi == in.PendingSpiToClient {
+				continue // already in the reap set
+			}
+			if gcOpen {
+				plan.Deletions = append(plan.Deletions, s.ipipEspStateKey)
+				continue
+			}
+			// Orphan path: no transition references this state and no
+			// bookkeeping exists to gate on -- age it out on kernel truth.
+			if in.ActivatedAt.IsZero() && !pendingSet &&
+				time.Duration(s.AddTime)*time.Second > in.PendingDeadline {
+				plan.Deletions = append(plan.Deletions, s.ipipEspStateKey)
+			}
+		case s.Src == in.Client && s.Dst == in.Server: // inbound
+			if in.ActiveSpiToServer == 0 {
+				continue // unknown active inbound: never delete any
+			}
+			if s.Spi == in.ActiveSpiToServer {
+				continue
+			}
+			if pendingLive && s.Spi == in.PendingSpiToServer {
+				continue
+			}
+			if pendingExpired && s.Spi == in.PendingSpiToServer {
+				continue // already in the reap set
+			}
+			if gcOpen {
+				plan.Deletions = append(plan.Deletions, s.ipipEspStateKey)
+			}
+		}
+	}
+	return plan
 }

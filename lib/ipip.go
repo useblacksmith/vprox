@@ -31,53 +31,53 @@ type ipipPeer struct {
 	txBytes  uint64
 
 	// espSpiToServer/ToClient are the SPIs of the pair's ACTIVE ESP
-	// generation (the one the outbound policy emits), or 0 for adopted
-	// peers (whose SPIs live only in the kernel until the client
-	// re-keys). Kept for log lines and as the GC keep-set; SA
-	// keys are never stored -- a prepared generation's material lives only
-	// in the kernel and in the HTTP response that delivered it.
+	// generation (the one the outbound policy emits). espSpiToClient is
+	// reconstructed from the kernel policy's reqid on restore;
+	// espSpiToServer may be 0 for adopted peers (unknown until the next
+	// rotation), which keeps the sweep's counter-gated GC closed for the
+	// pair. SA keys are never stored -- a prepared generation's material
+	// lives only in the kernel and in the HTTP response that delivered it.
 	espSpiToServer uint32
 	espSpiToClient uint32
-
-	// espRekeyEpoch is reassigned from the server-global monotonic counter
-	// (srv.nextEspEpochLocked) on every request that touches the pair's
-	// ESP state (prepare, activate, abandon, destructive replace) and on
-	// teardown (see dropIpipPeerLocked). The
-	// background GC/reap goroutines capture the epoch and abort once it no
-	// longer matches. Because the counter is process-global, an epoch can
-	// never repeat -- not even on a re-created peer struct for the same
-	// client IP -- so a stale goroutine can never delete SAs that belong
-	// to a newer request or a newer peer.
-	espRekeyEpoch uint64
 
 	// espPendingSpiToServer/ToClient are the SPIs of a PREPAREd but not
 	// yet activated generation (both states already live in the kernel,
 	// outbound under its own reqid, not selected by the policy). Zero when
-	// no rotation is in flight.
+	// no rotation is in flight. espPreparedAt is the prepare time; the
+	// housekeeping sweep reaps a pending generation past its deadline
+	// (there is no abandon op -- the deadline IS the cleanup path).
 	espPendingSpiToServer uint32
 	espPendingSpiToClient uint32
+	espPreparedAt         time.Time
 
-	// espPrevSpiToServer/ToClient are the previous active generation's
-	// SPIs, recorded at ACTIVATE. The generation stays installed (both
-	// directions still decrypt) until the counter-gated GC sweeps it; an
-	// ABANDON of the activated generation restores it as active.
-	espPrevSpiToServer uint32
-	espPrevSpiToClient uint32
-
-	// espPrevReqid is the outbound policy's template reqid captured just
-	// before the last ACTIVATE flip (read from the kernel, so it is
-	// correct even for adopted pairs). ABANDON flips the policy back to
-	// it. Note reqid 0 is a valid value (legacy generations), so
-	// espPrevReqidValid gates its use.
-	espPrevReqid      int
-	espPrevReqidValid bool
+	// espActivatedAt is when the active generation's fenced ACTIVATE
+	// landed. The sweep's GC of the superseded generation requires this
+	// grace to elapse on top of the counter-gated switch proof.
+	espActivatedAt time.Time
 }
 
-type connectIpipResponse struct {
+// Op-specific /connect-ipip response schemas. connect and prepare return
+// the minted key material; activate returns only the pair's (post-call)
+// active generation. A fenced-out activate returns 409 with a
+// connectIpipConflictResponse so the client can resync its view of the
+// active generation without a second protocol.
+type connectIpipConnectResponse struct {
 	AssignedAddr string
-	// Esp carries the minted key material on setup and PREPARE responses;
-	// ACTIVATE and ABANDON responses carry only AssignedAddr.
-	Esp *connectIpipEspResponse `json:",omitempty"`
+	Esp          *connectIpipEspResponse
+}
+
+type connectIpipActivateResponse struct {
+	AssignedAddr string
+	// Active is the outbound policy's selected generation (SpiToClient,
+	// lowercase hex) after this call.
+	Active string
+}
+
+type connectIpipConflictResponse struct {
+	Error string
+	// Active is the currently selected generation (SpiToClient, lowercase
+	// hex) when the server could read it; empty otherwise.
+	Active string `json:",omitempty"`
 }
 
 // connectIpipEspResponse carries the minted SA material to the client over
@@ -352,12 +352,25 @@ func (srv *Server) RestoreIpipFromKernel() error {
 	now := time.Now()
 	srv.ipipMu.Lock()
 	for _, c := range adopt {
-		srv.ipipPeers[c.Remote] = &ipipPeer{
+		p := &ipipPeer{
 			clientIP: c.Remote,
 			peerIP:   c.PeerIP,
 			ifname:   c.Ifname,
 			lastSeen: now,
 		}
+		// Reconstruct the active generation from kernel truth: the
+		// outbound policy's template reqid IS the active generation's
+		// SpiToClient (reqids are derived from the SPI). No transition
+		// state is persisted across restarts by design -- pending/orphan
+		// states are swept by the housekeeper, and the client's fenced
+		// ACTIVATE carries its own expectedActive, so nothing here needs
+		// more than the active identity. The to-server SPI stays unknown
+		// (0), which keeps the sweep's counter-gated GC closed for the
+		// pair until the client's next successful rotation.
+		if reqid, found, err := srv.outboundIpipEspPolicyReqid(c.Remote); err == nil && found && reqid != 0 {
+			p.espSpiToClient = uint32(reqid)
+		}
+		srv.ipipPeers[c.Remote] = p
 	}
 	srv.ipipMu.Unlock()
 
@@ -492,30 +505,46 @@ func (srv *Server) connectIpipHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
+	// The wire gate: version and op are validated BEFORE any peer lookup
+	// or mutation, so no request shape (least of all an empty body) can
+	// imply a destructive install.
 	if err := req.validate(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	resp, errMsg, errStatus := srv.lookupOrCreateIpip(clientIP, req)
-	if errMsg != "" {
-		http.Error(w, errMsg, errStatus)
+	status, body := srv.serveIpip(clientIP, req)
+	if msg, plain := body.(string); plain {
+		http.Error(w, msg, status)
 		return
 	}
-	writeIpipResponse(w, resp)
+	writeIpipResponse(w, status, body)
 }
 
-// lookupOrCreateIpip returns the connect response for clientIP, creating the
-// kernel tunnel if needed and installing (or removing) the pair's ESP state
-// per the request. It holds ipipMu for the whole lookup/create so the peer
-// map and the kernel (local, remote) pair stay in lockstep, and so ESP state
-// is installed before the HTTP response is written by the caller.
-func (srv *Server) lookupOrCreateIpip(clientIP netip.Addr, req connectIpipRequest) (resp *connectIpipResponse, errMsg string, errStatus int) {
+// serveIpip dispatches a validated /connect-ipip request. It holds ipipMu
+// for the whole lookup/create/mutate so the peer map and the kernel
+// (local, remote) pair stay in lockstep, and so ESP state is installed
+// before the HTTP response is written by the caller. Returns the HTTP
+// status plus either a JSON-marshalable response body or a plain error
+// string.
+func (srv *Server) serveIpip(clientIP netip.Addr, req connectIpipRequest) (int, any) {
 	srv.ipipMu.Lock()
 	defer srv.ipipMu.Unlock()
 
 	if srv.ipipClosed {
-		return nil, "server shutting down", http.StatusServiceUnavailable
+		return http.StatusServiceUnavailable, "server shutting down"
+	}
+
+	if req.Op == ipipOpActivate {
+		// Activate NEVER creates or rebuilds a tunnel: it is a pure CAS
+		// on an existing pair's outbound policy. An unknown peer is a
+		// conflict, not a build request.
+		p, ok := srv.ipipPeers[clientIP]
+		if !ok {
+			return http.StatusConflict, "no IPIP peer for this client; connect first"
+		}
+		p.lastSeen = time.Now()
+		return srv.serveIpipActivateLocked(p, req)
 	}
 
 	if existing, ok := srv.ipipPeers[clientIP]; ok {
@@ -529,120 +558,103 @@ func (srv *Server) lookupOrCreateIpip(clientIP netip.Addr, req connectIpipReques
 		}
 		if !vanished {
 			existing.lastSeen = time.Now()
-			return srv.finishIpipConnectLocked(existing, req)
+			return srv.serveIpipMintLocked(existing, req)
 		}
 		log.Printf("[%v] ipip iface %s for %v vanished; rebuilding",
 			srv.BindAddr, existing.ifname, clientIP)
 		if err := srv.dropIpipPeerLocked(existing); err != nil {
 			log.Printf("[%v] failed to tear down vanished ipip iface %s for %v: %v; leaving in place",
 				srv.BindAddr, existing.ifname, clientIP, err)
-			return nil, "failed to rebuild IPIP tunnel", http.StatusInternalServerError
+			return http.StatusInternalServerError, "failed to rebuild IPIP tunnel"
 		}
 		delete(srv.ipipPeers, clientIP)
 	}
 
 	peer, errMsg, errStatus := srv.createIpipPeerLocked(clientIP)
 	if errMsg != "" {
-		return nil, errMsg, errStatus
+		return errStatus, errMsg
 	}
-	return srv.finishIpipConnectLocked(peer, req)
+	return srv.serveIpipMintLocked(peer, req)
 }
 
-// finishIpipConnectLocked applies the request's ESP choice to an existing or
-// freshly created peer and builds the response. Caller must hold ipipMu.
-//
-// esp (without rekey) mints a fresh SA pair and replaces whatever the
-// kernel holds for the pair -- the destructive fresh-connect semantics.
-// esp+rekey is the forward-only rotation protocol: PREPARE mints and
-// installs a new generation without emitting on it; ACTIVATE flips the
-// outbound policy to it; ABANDON walks a failed rotation back without
-// deleting any active state (see the package comment in ipip_esp.go).
-// Plaintext requests never reach here: ESP is mandatory and validate()
-// rejects them at the handler with a 400, before any peer is looked up
-// or created. (The old {}-strips-ESP rollback path is gone with it.)
-//
-// Every branch bumps espRekeyEpoch first, so any in-flight GC/reap
-// goroutine from a previous request aborts instead of touching state that
-// this request supersedes.
-func (srv *Server) finishIpipConnectLocked(p *ipipPeer, req connectIpipRequest) (resp *connectIpipResponse, errMsg string, errStatus int) {
-	resp = &connectIpipResponse{
-		AssignedAddr: fmt.Sprintf("%v/%d", p.peerIP, srv.WgCidr.Bits()),
-	}
-
-	p.espRekeyEpoch = srv.nextEspEpochLocked()
-
-	if req.Activate != "" {
-		spi, _ := parseIpipEspSpiHex(req.Activate) // validated by the handler
-		if err := srv.activateIpipEsp(p, spi); err != nil {
-			log.Printf("[%v] esp activate FAILED for ipip peer %v (%s, spi to-client 0x%x): %v",
-				srv.BindAddr, p.clientIP, p.ifname, spi, err)
-			return nil, "failed to activate ESP generation", http.StatusConflict
+// serveIpipActivateLocked runs the fenced activate. Caller must hold
+// ipipMu and have validated the request.
+func (srv *Server) serveIpipActivateLocked(p *ipipPeer, req connectIpipRequest) (int, any) {
+	target, _ := parseIpipEspSpiHex(req.Target) // validated by the handler
+	expected, _ := parseIpipEspSpiHex(req.ExpectedActive)
+	status, active, err := srv.activateIpipEsp(p, target, expected)
+	switch status {
+	case ipipActivateOk:
+		return http.StatusOK, &connectIpipActivateResponse{
+			AssignedAddr: fmt.Sprintf("%v/%d", p.peerIP, srv.WgCidr.Bits()),
+			Active:       fmt.Sprintf("%x", active),
 		}
-		return resp, "", 0
-	}
-	if req.Abandon != "" {
-		spi, _ := parseIpipEspSpiHex(req.Abandon)
-		if err := srv.abandonIpipEsp(p, spi); err != nil {
-			log.Printf("[%v] esp abandon FAILED for ipip peer %v (%s, spi to-client 0x%x): %v",
-				srv.BindAddr, p.clientIP, p.ifname, spi, err)
-			return nil, "failed to abandon ESP generation", http.StatusInternalServerError
+	case ipipActivateConflict:
+		log.Printf("[%v] esp activate FENCED for ipip peer %v (%s, target 0x%x, expected 0x%x): %v",
+			srv.BindAddr, p.clientIP, p.ifname, target, expected, err)
+		body := &connectIpipConflictResponse{Error: err.Error()}
+		if active != 0 {
+			body.Active = fmt.Sprintf("%x", active)
 		}
-		return resp, "", 0
+		return http.StatusConflict, body
+	default:
+		log.Printf("[%v] esp activate FAILED for ipip peer %v (%s, target 0x%x): %v",
+			srv.BindAddr, p.clientIP, p.ifname, target, err)
+		return http.StatusInternalServerError, "failed to activate ESP generation"
 	}
+}
 
+// serveIpipMintLocked handles op=connect (destructive fresh install) and
+// op=prepare (additive forward-only generation). Caller must hold ipipMu.
+func (srv *Server) serveIpipMintLocked(p *ipipPeer, req connectIpipRequest) (int, any) {
 	keys, err := mintIpipEspKeys()
 	if err != nil {
 		log.Printf("[%v] esp key minting failed for ipip peer %v: %v",
 			srv.BindAddr, p.clientIP, err)
-		return nil, "failed to mint ESP keys", http.StatusInternalServerError
+		return http.StatusInternalServerError, "failed to mint ESP keys"
 	}
 
 	fresh := false
-	if req.Rekey {
-		fresh, err = srv.prepareIpipEspRekey(p, keys)
+	if req.Op == ipipOpPrepare {
+		fresh, err = srv.prepareIpipEsp(p, keys)
 		if err != nil {
-			log.Printf("[%v] esp rekey prepare FAILED for ipip peer %v (%s): %v",
+			log.Printf("[%v] esp prepare FAILED for ipip peer %v (%s): %v",
 				srv.BindAddr, p.clientIP, p.ifname, err)
-			return nil, "failed to prepare ESP rekey", http.StatusInternalServerError
+			return http.StatusInternalServerError, "failed to prepare ESP generation"
 		}
 	} else {
 		if err := srv.installIpipEsp(p.clientIP, p.ifname, keys); err != nil {
 			log.Printf("[%v] esp install FAILED for ipip peer %v (%s): %v",
 				srv.BindAddr, p.clientIP, p.ifname, err)
-			return nil, "failed to install ESP", http.StatusInternalServerError
+			return http.StatusInternalServerError, "failed to install ESP"
 		}
 		p.setActiveEspGeneration(keys.ToServer.Spi, keys.ToClient.Spi)
 		log.Printf("[%v] esp installed for ipip peer %v (%s, spi to-server 0x%x, to-client 0x%x, alg %s)",
 			srv.BindAddr, p.clientIP, p.ifname, keys.ToServer.Spi, keys.ToClient.Spi, ipipEspAlgorithm)
 	}
 
-	resp.Esp = &connectIpipEspResponse{
-		Algorithm:       ipipEspAlgorithm,
-		SpiToServer:     keys.ToServer.Spi,
-		EncKeyToServer:  hex.EncodeToString(keys.ToServer.EncKey),
-		AuthKeyToServer: hex.EncodeToString(keys.ToServer.AuthKey),
-		SpiToClient:     keys.ToClient.Spi,
-		EncKeyToClient:  hex.EncodeToString(keys.ToClient.EncKey),
-		AuthKeyToClient: hex.EncodeToString(keys.ToClient.AuthKey),
-		Fresh:           fresh,
+	return http.StatusOK, &connectIpipConnectResponse{
+		AssignedAddr: fmt.Sprintf("%v/%d", p.peerIP, srv.WgCidr.Bits()),
+		Esp: &connectIpipEspResponse{
+			Algorithm:       ipipEspAlgorithm,
+			SpiToServer:     keys.ToServer.Spi,
+			EncKeyToServer:  hex.EncodeToString(keys.ToServer.EncKey),
+			AuthKeyToServer: hex.EncodeToString(keys.ToServer.AuthKey),
+			SpiToClient:     keys.ToClient.Spi,
+			EncKeyToClient:  hex.EncodeToString(keys.ToClient.EncKey),
+			AuthKeyToClient: hex.EncodeToString(keys.ToClient.AuthKey),
+			Fresh:           fresh,
+		},
 	}
-	return resp, "", 0
-}
-
-// clearEspGenerations resets every per-generation field (destructive
-// full install, teardown bookkeeping).
-func (p *ipipPeer) clearEspGenerations() {
-	p.espSpiToServer, p.espSpiToClient = 0, 0
-	p.espPendingSpiToServer, p.espPendingSpiToClient = 0, 0
-	p.espPrevSpiToServer, p.espPrevSpiToClient = 0, 0
-	p.espPrevReqid, p.espPrevReqidValid = 0, false
 }
 
 // setActiveEspGeneration records a destructive full install: one active
-// generation, nothing pending, nothing previous.
+// generation, nothing pending, no transition in flight.
 func (p *ipipPeer) setActiveEspGeneration(spiToServer, spiToClient uint32) {
-	p.clearEspGenerations()
 	p.espSpiToServer, p.espSpiToClient = spiToServer, spiToClient
+	p.espPendingSpiToServer, p.espPendingSpiToClient = 0, 0
+	p.espPreparedAt = time.Time{}
+	p.espActivatedAt = time.Time{}
 }
 
 // createIpipPeerLocked allocates an inner IP, creates the IPIP tunnel, and
@@ -699,12 +711,6 @@ func (srv *Server) createIpipPeerLocked(clientIP netip.Addr) (peer *ipipPeer, er
 // and must not have deleted p from ipipPeers yet. On error the map entry,
 // allocator claim, and kernel iface are left as-is.
 func (srv *Server) dropIpipPeerLocked(p *ipipPeer) error {
-	// Supersede any in-flight rekey GC/reap goroutine BEFORE touching the
-	// kernel: goroutines look the peer up by client IP, so without this a
-	// stale poller could act on a re-created peer with the same client IP.
-	// The epoch source is process-global and monotonic, so the captured
-	// value can never match again.
-	p.espRekeyEpoch = srv.nextEspEpochLocked()
 	if err := srv.tearDownIpipLink(p.ifname, p.peerIP); err != nil {
 		return err
 	}
@@ -751,13 +757,14 @@ func ipipLinkNotFound(err error) bool {
 	return errors.As(err, &notFound)
 }
 
-func writeIpipResponse(w http.ResponseWriter, resp *connectIpipResponse) {
+func writeIpipResponse(w http.ResponseWriter, status int, resp any) {
 	respBuf, err := json.Marshal(resp)
 	if err != nil {
 		http.Error(w, "failed to serialize response", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
 	_, _ = w.Write(respBuf)
 }
 
@@ -949,7 +956,10 @@ func (srv *Server) removeIpipPeerFilter(ifname string, peerIP netip.Addr) {
 	}
 }
 
-func (srv *Server) removeVanishedIpipPeersLoop() {
+// ipipVanishedPeersOnlyLoop is the non-linux housekeeping fallback: only
+// the vanished-peer half runs (the ESP half needs xfrm). On linux the full
+// sweep lives in ipipHousekeepingLoop.
+func (srv *Server) ipipVanishedPeersOnlyLoop() {
 	for {
 		select {
 		case <-srv.Ctx.Done():

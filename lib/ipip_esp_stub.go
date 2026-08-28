@@ -20,14 +20,27 @@ func (srv *Server) removeIpipEsp(clientIP netip.Addr) error {
 	return nil
 }
 
-func (srv *Server) prepareIpipEspRekey(p *ipipPeer, keys ipipEspKeys) (bool, error) {
-	return false, errors.New("ipip esp rekey requires linux xfrm")
+func (srv *Server) prepareIpipEsp(p *ipipPeer, keys ipipEspKeys) (bool, error) {
+	return false, errors.New("ipip esp prepare requires linux xfrm")
 }
 
-func (srv *Server) activateIpipEsp(p *ipipPeer, spiToClient uint32) error {
-	return errors.New("ipip esp activate requires linux xfrm")
+type ipipEspActivateStatus int
+
+const (
+	ipipActivateOk ipipEspActivateStatus = iota
+	ipipActivateConflict
+	ipipActivateError
+)
+
+func (srv *Server) activateIpipEsp(p *ipipPeer, target, expectedActive uint32) (ipipEspActivateStatus, uint32, error) {
+	return ipipActivateError, 0, errors.New("ipip esp activate requires linux xfrm")
 }
 
-func (srv *Server) abandonIpipEsp(p *ipipPeer, spiToClient uint32) error {
-	return errors.New("ipip esp abandon requires linux xfrm")
+func (srv *Server) outboundIpipEspPolicyReqid(clientIP netip.Addr) (int, bool, error) {
+	return 0, false, nil
+}
+
+func (srv *Server) ipipHousekeepingLoop() {
+	// The vanished-peer half still runs; the ESP half needs xfrm.
+	srv.ipipVanishedPeersOnlyLoop()
 }

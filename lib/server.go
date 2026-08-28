@@ -118,20 +118,12 @@ type Server struct {
 	// with WireGuard peer state. Do not hold it across HTTP writes.
 	ipipMu     sync.Mutex
 	ipipPeers  map[netip.Addr]*ipipPeer
-	ipipClosed bool // set by CleanupIpip; lookupOrCreateIpip refuses new tunnels
+	ipipClosed bool // set by CleanupIpip; serveIpip refuses new tunnels
 
-	// espEpochCounter is the process-global source for ipipPeer
-	// espRekeyEpoch values. Guarded by ipipMu. Monotonic, so an epoch
-	// captured by a background goroutine can never be observed again once
-	// superseded -- even across peer re-creation for the same client IP.
-	espEpochCounter uint64
-}
-
-// nextEspEpochLocked returns the next ESP rekey epoch. Caller must hold
-// ipipMu.
-func (srv *Server) nextEspEpochLocked() uint64 {
-	srv.espEpochCounter++
-	return srv.espEpochCounter
+	// ipipSweepHealth tracks the housekeeping sweep's pass/error counters
+	// and last success for the log-based sweep health lines (vprox has no
+	// prometheus).
+	ipipSweepHealth ipipSweepHealth
 }
 
 // InitState initializes the private server state.
@@ -921,7 +913,7 @@ func (srv *Server) ListenForHttps() error {
 	}
 
 	go srv.removeIdlePeersLoop()
-	go srv.removeVanishedIpipPeersLoop()
+	go srv.ipipHousekeepingLoop()
 
 	// Some bind addresses may not have been added to the network interface. If
 	// that is the case, we need to add it (transiently).

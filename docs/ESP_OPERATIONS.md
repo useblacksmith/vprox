@@ -2,158 +2,171 @@
 
 Operational notes for the ESP layer on the IPIP outer path. Audience:
 whoever is on call when a vprox deploy or the Mac static-IP feature needs
-to be rolled back in a hurry.
+attention in a hurry.
 
-**ESP is MANDATORY on `/connect-ipip`.** The server rejects plaintext
-bodies (`{}`, missing/false `esp`) with HTTP 400 "ESP required" before
-touching any state, and the Mac agent hard-fails setup if a vprox answer
-carries no ESP material. Plaintext IPIP is NOT a supported fallback state:
-there is no production configuration that turns it on. (The only override
-is the agent's test-only `BLACKSMITH_STATIC_IP_ALLOW_PLAINTEXT=1` env
-hatch for staging/lab debugging; nothing in production sets it.) This is
-safe because `/connect-ipip` has never carried production traffic — prod
-vproxes 405 it — so there are no deployed plaintext clients to stay
-compatible with. The WireGuard `/connect` path is unaffected.
+**ESP is MANDATORY on `/connect-ipip`, and the wire protocol is versioned.**
+Every request must be `{"version":1,"op":...}` with op one of
+`connect | prepare | activate`; anything else — including the empty body,
+`{}`, and every legacy `{"esp":...}` shape — is rejected with HTTP 400
+BEFORE any peer lookup or mutation. There is no plaintext IPIP, no request
+flag to ask for it, and no environment override on the agent (the old
+test-only `BLACKSMITH_STATIC_IP_ALLOW_PLAINTEXT` hatch is gone; tests use
+an in-process seam). This is safe because `/connect-ipip` has never
+carried production traffic — prod vproxes 405 it — so there are no
+deployed clients to stay compatible with. The WireGuard `/connect` path is
+unaffected.
 
-**The emergency brake is stopping static-IP admission, not downgrading to
-plaintext.** If ESP breaks fleet-wide, stop admitting new Mac static-IP
-jobs (and roll back per the runbook below); do not attempt to run the
-fleet plaintext. **Rollout gate:** do not register us-central orgs for
-Mac static IP until BOTH the vprox fleet and the Mac agents are deployed
-from matching revisions — the feature is dark until both sides are live,
-and a half-deployed pair fails setup cleanly (400 or agent refusal)
-rather than degrading.
+## The forward-only rotation contract (no rollback)
 
-## Emergency rollback runbook
+The SAs have no lifetimes and no ESN (macOS setkey cannot install ESN), so
+a non-ESN SA hard-stops at sequence 2^32; the Mac agent's tunnel actor
+rotates SA generations hourly. Generations move FORWARD ONLY — no SA is
+ever deleted and re-added (a re-added outbound resets its sequence counter
+while the peer's anti-replay high-water mark survives: instant permanent
+blackhole on a mature tunnel), and there is **no abandon, no revert, no
+rollback of any kind**:
 
-A binary downgrade alone is NOT a rollback. ESP state lives in the kernel,
-not in the process: SAs and require-ESP policies survive a vprox restart by
-design (`RestoreIpipFromKernel` leaves xfrm alone), and the Mac minis hold
-the matching state in their own kernels. A downgraded binary that no longer
-understands ESP leaves those require-ESP policies in place, and every
-plaintext IPIP packet matching them is dropped — the tunnel blackholes
-instead of downgrading.
+```text
+stable N → prepared N+1 → activated N+1 → proven → switched → stable N+1
 
-Rolling back therefore means, in this order:
+failure before ACTIVATE           → reap pending, retry at next hourly tick (N untouched)
+proof/switch failure INCONCLUSIVE → nothing destructive; re-prove next tick
+proof/switch failure DEAD         → exactly ONE forward retry (fresh N+2, in-tick)
+retry also DEAD                   → TERMINAL
+```
 
-1. **vprox box** — downgrade the binary. The deploy playbook
-   (`setup_vprox_server.yaml`) preserves the previously running binary as
-   `~/vprox.bak-<date>` in the service user's home directory (next to the
-   `~/vprox` checkout it replaces) before each rebuild; copy it back over
-   `~/vprox/vprox` and `systemctl restart vprox`. Then flush the kernel
-   ESP state:
+Wire ops:
+
+* `{"version":1,"op":"connect"}` — destructive fresh install (new tunnel).
+* `{"version":1,"op":"prepare"}` — mint + install generation N+1 on the
+  vprox side without flipping the outbound policy; keys returned over TLS.
+* `{"version":1,"op":"activate","target":"<hex>","expectedActive":"<hex>"}`
+  — **fenced** compare-and-swap flip of the outbound policy: it succeeds
+  only if the policy currently selects `expectedActive`'s generation. A
+  delayed/replayed activate for a superseded generation gets HTTP 409, a
+  body naming the real active generation, and mutates NOTHING. Activating
+  the already-active target is idempotent 200.
+
+Server-side failure handling is ONE housekeeping sweep (every 5 s,
+extending the vanished-peer reaper): reap prepared-but-never-activated
+generations after ~5 min (`VPROX_ESP_PENDING_DEADLINE`), counter-gated GC
+of superseded generations after the client provably transmits on the new
+one plus a ~2 min grace (`VPROX_ESP_GC_GRACE`), orphan aging, and
+vanished-peer reaping. The sweep never touches the active generation, a
+pending within deadline, or anything a transition references, and treats
+an unreadable counter as UNKNOWN (skip), never as zero. Sweep health is
+log-based: `ipip housekeeping healthy` every ~10 min plus immediate error
+lines.
+
+There are no per-rekey goroutines, no epochs, no activation gate, no
+auto-revert: the fenced activate plus the sweep replace all of it.
+
+## Restart semantics
+
+`RestoreIpipFromKernel` adopts leftover tunnels and reconstructs each
+pair's ACTIVE generation from kernel truth — the outbound policy's
+template reqid IS the active generation's SpiToClient. No transition state
+is persisted: orphan pending states are swept by the housekeeper after
+their deadline, and the client's fenced activate carries its own
+`expectedActive`, so a restarted vprox answers it correctly with no
+memory. **A restart mid-transition also loses the Mac agent's one-recovery
+budget** (it lives on the actor goroutine's stack, deliberately never
+persisted), so the next evaluation after a crash-loop may go TERMINAL
+instead of retrying — accepted: a tunnel that keeps crashing mid-rotation
+should die loudly, not wobble.
+
+## TERMINAL (replaces rollback, strikes, and seppuku)
+
+When a tunnel cannot rotate — a rotation convicted DEAD twice within one
+recovery budget, the sequence-headroom audit crossing 2^31
+(`BLACKSMITH_STATIC_IP_SEQ_TERMINAL_THRESHOLD` overrides for tests) while
+rotation is blocked, or vprox reporting the pair rebuilt (`Fresh`) — the
+Mac agent runs the TERMINAL procedure:
+
+1. stop admissions on the tunnel entry;
+2. join the tunnel actor (join timeout ⇒ quarantine; nothing is destroyed
+   while the owner may still run);
+3. install per-VM **PF drop guards** for the exact holder set and kill
+   their pf states, VERIFYING the drops took effect **before** the gif is
+   destroyed. This is fail-closed by construction: the per-VM `route-to`
+   rule is stateful and the baseline mac policy broadly allows VM
+   internet, so without guards a destroyed gif would let VM traffic egress
+   `en0` under the mini's own source IP — an allowlist-contract violation
+   worse than the outage. If a guard cannot be verified, the entry is
+   quarantined with the gif intact instead.
+4. terminate every holder VM through the VM-stop machinery with the
+   distinct `StaticIPTunnelLost{VMID, JobID, VproxIP}` reason;
+5. tear down (gif destroyed + verified absent, IPsec flushed, entry
+   removed); the next acquisition builds fresh;
+6. emit `blacksmith_vm_static_ip_terminal` (reason + vprox_server_ip) and
+   `blacksmith_vm_static_ip_terminal_jobs`.
+
+**Product decision (approved, do not regress): jobs terminated by a
+TERMINAL event are NOT automatically rerun.** This is the same contract as
+host death. The termination is attributed as infrastructure (never a
+customer failure) and the terminal counter pages, so the attribution is
+loud; replaying the affected work is a human/product decision, not agent
+behavior. Documented in `jobsbase.StaticIPTunnelLost` and the vm-agent
+alert rules.
+
+## Observability and the canary plan
+
+Alerting lives in the FA repo
+(`agent/grafana/alerts/infrastructure/vm-agent.yaml`):
+
+* rekey-overdue on `blacksmith_vm_static_ip_rekey_last_success_age_seconds`
+  — warn at 2 h, page at 3 h (a genuinely failing tunnel goes terminal
+  within one tick, so a climbing age means a permanent-INCONCLUSIVE
+  environment or a wedged actor);
+* `blacksmith_vm_static_ip_rotation_attempts{phase,outcome}` — every
+  rotation phase outcome; the `outcome="dead"` delta alerts as the early
+  warning;
+* `blacksmith_vm_static_ip_terminal` — **page-level**; every terminal
+  event pages with its reason and vprox attribution.
+
+These metrics are the CANARY for wide enablement: run the fleet at
+staging/limited scope and measure the real-world p(dead)/rotation and
+p(terminal)/rotation from `rotation_attempts` and `terminal` before
+enabling more orgs. A terminal rate visibly above the vprox-host incident
+rate means the proof/switch path is misfiring and enablement must pause.
+
+vprox itself has no prometheus; its sweep health, fence rejections
+(`esp activate FENCED`), and reap/GC decisions are structured log lines in
+the vprox journal.
+
+## Emergency handling
+
+A binary downgrade alone is NOT a rollback: ESP state lives in the kernel,
+not the process (SAs and require-ESP policies survive a vprox restart by
+design, and the minis hold matching state). **The emergency brake is
+stopping static-IP admission, not downgrading.** If ESP breaks fleet-wide:
+
+1. Stop admitting new Mac static-IP jobs.
+2. **vprox box** — if the binary must move, the deploy playbook
+   (`setup_vprox_server.yaml`) preserves the previous binary as
+   `~/vprox.bak-<date>`; copy it back over `~/vprox/vprox` and
+   `systemctl restart vprox`. Then flush kernel ESP state:
 
    ```
    ip xfrm state flush
    ip xfrm policy flush
    ```
 
-   These flush *all* xfrm state on the box. vprox's WireGuard path does not
-   use xfrm, so on a vprox gateway this is safe; every ESP'd IPIP pair on
-   the box is affected regardless (that is the point of the rollback).
+   (Flushes ALL xfrm on the box; vprox's WireGuard path does not use
+   xfrm, so on a vprox gateway this is safe.)
+3. **Each affected Mac mini** — `setkey -F` (SAs) and `setkey -FP`
+   (policies), then let the agents rebuild through the normal setup path.
 
-2. **Each affected Mac mini** — flush the SAD and SPD:
-
-   ```
-   setkey -F    # flush SAs
-   setkey -FP   # flush policies
-   ```
-
-   Without this, the mini keeps encrypting outbound (vprox can no longer
-   decrypt) and keeps requiring ESP inbound (plaintext from vprox is
-   dropped). The agent's next fresh setup re-creates everything it needs;
-   flushing is always safe on a mini whose tunnels are being rolled back.
-
-3. The minis' cached gif tunnels will fail their next health check /
-   rekey tick and be rebuilt through the normal setup path (or seppuku +
-   fresh setup). No manual gif surgery is required, but
-   `ifconfig gifN destroy` per leftover gif accelerates recovery.
-
-### How far back can the binary go?
-
-* Rolling back the server to a pre-ESP but IPIP-aware build does NOT
-  keep existing tunnels flowing on its own: live pairs hold require-ESP
-  kernel policies on BOTH sides, and a downgraded server that answers
-  `{"esp": true}` without ESP material leaves those policies dropping
-  every plaintext IPIP packet. The flush steps above unblackhole the
-  kernels, but fresh setups still FAIL: current agents refuse a tunnel
-  without ESP material (ESP is mandatory, fail-closed). A pre-ESP server
-  is therefore not a working configuration — treat that rollback as
-  "static IP is down until roll-forward" and stop static-IP admission
-  for the duration.
-* Rolling back to pre-PR-18 main removes `/connect-ipip` entirely. Mac
-  static IP is all-or-nothing on that endpoint: every Mac static-IP job
-  in the fleet fails until the roll-forward. The blast radius is the
-  same as the pre-ESP rollback above (static IP down), so preferring one
-  over the other is about the bug you are escaping, not about keeping
-  tunnels alive.
-* **Cross-boundary skew within the rekey protocol is NOT supported.**
-  Earlier drafts of the rekey protocol (the switch-by-timeout build, and
-  the first forward-only draft without provisional activation) are NOT
-  wire-compatible with the current one, despite sharing the
-  PREPARE/ACTIVATE/ABANDON verbs: their failure-handling contracts differ
-  (no activation auto-revert, different switch semantics), and a mixed
-  pair can diverge kernel state in ways that only a mature tunnel
-  reveals. The ONLY skew that works is a pre-rekey ESP agent against a
-  new server (fresh connects succeed; such agents never send rekey
-  mutations). A genuinely pre-ESP agent fails setup cleanly with the
-  mandatory-ESP 400 and mutates nothing. Everything else must be
-  deployed from matching revisions -- which the version gate (next
-  section) enforces mechanically.
-
-## Rekey protocol version gate
-
-Every rekey MUTATION (`{"esp":true,"rekey":true}` PREPARE, ACTIVATE,
-ABANDON) must carry `"espRekeyV": 2`. The server rejects versionless or
-mismatched mutations with HTTP 400 and a message naming both versions,
-BEFORE touching any state. Fresh connects (`{"esp":true}` without
-`rekey`) are exempt. Plaintext bodies never reach the version gate: the
-mandatory-ESP check 400s them first ("ESP required"), so a genuinely
-pre-ESP agent against a new server fails setup cleanly — that skew is
-"supported" only in the sense that it fails fast and mutates nothing.
-
-Operationally: after a partial deploy (old agent + new server or vice
-versa), rekey ticks fail fast with the 400 instead of half-running a
-protocol the two sides disagree on; the agents' strike machinery tears
-the affected tunnels down and rebuilds them once versions match. If the
-version-gate 400s show up in the vprox journal, finish the deploy on
-whichever side is behind.
-
-## Provisional activation (auto-revert)
-
-An ACTIVATE only provisionally flips the pair's outbound policy. If no
-packet arrives on the newly activated generation's inbound SA before the
-activation gate expires (~2 minutes; the happy-path client transmits on
-the new generation within seconds), the server flips the policy BACK to
-the previous generation's reqid on its own and logs loudly
-(`esp AUTO-REVERT`). This makes a LOST client ABANDON harmless: a client
-whose proof failed keeps transmitting on its old generation, and the
-server stops emitting on the unproven one without any message arriving.
-Auto-revert and ABANDON are mutually idempotent (epoch- and
-reqid-guarded), so duplicates in either order are no-ops. Nothing is
-deleted by either path; unproven generations are swept by the next
-successful rotation's GC.
-
-## Mac agent rollout gates (staging-verified prerequisites)
-
-* The Mac agent refuses plaintext static-IP tunnels BY DEFAULT — ESP
-  mandatory is the shipped behavior, and there is no flag to enable it
-  (fail-closed needs no configuration). The only related env var is the
-  test-only `BLACKSMITH_STATIC_IP_ALLOW_PLAINTEXT=1` escape hatch, which
-  weakens the default for staging/lab debugging; it must never be set in
-  any Doppler config (`gha-agent` `stg` or `prd`).
-* Rekey alerting lives in the FA repo
-  (`agent/grafana/alerts/infrastructure/vm-agent.yaml`): rekey-overdue
-  warning at 2h / page at 3h on
-  `blacksmith_vm_static_ip_rekey_last_success_age_seconds`, plus
-  immediate alerts on `blacksmith_vm_static_ip_rekey_failed` and
-  `blacksmith_vm_static_ip_rekey_seppuku`. Deploying those rules is a
-  prerequisite for enabling hourly rekey in production.
+Cross-revision skew within the rotation protocol is NOT supported: the
+explicit `version` on every request rejects a mismatched pair with a 400
+before any state is touched, so a half-deployed fleet fails setup cleanly
+instead of degrading. Deploy both sides from matching revisions and keep
+the feature dark until both are live.
 
 ## Accepted threat model
 
-The ESP keys are minted by vprox and delivered to the Mac helper inside the
-`/connect-ipip` HTTPS response. That TLS channel uses vprox's embedded
+The ESP keys are minted by vprox and delivered to the Mac helper inside
+the `/connect-ipip` HTTPS response. That TLS channel uses vprox's embedded
 self-signed certificate and the client dials with certificate verification
 disabled (`InsecureSkipVerify`), authenticating itself with the shared
 bearer password. Consequences, accepted deliberately:
@@ -177,17 +190,18 @@ bearer password. Consequences, accepted deliberately:
 Related invariants the code maintains (do not regress):
 
 * Key material never appears in argv, logs, or error strings (helpers read
-  secrets from stdin JSON; outputs are hex-redacted).
-* SA generations are FORWARD-ONLY: no SA is ever deleted and re-added.
-  Re-adding an outbound SA resets its sequence counter while the peer's
-  inbound anti-replay high-water mark survives, so on a mature tunnel
-  every packet of the re-added generation is dropped as a replay. The
-  rekey protocol therefore proves the new generation carries traffic on
-  the wire (PREPARE -> client inbound install -> ACTIVATE policy flip ->
-  counter-verified proof) before the client abandons its old outbound
-  path, and each side retires old state only on kernel-counter evidence.
-  A failed rotation retries forward with a fresh generation, never by
-  resurrecting an old one.
+  secrets from stdin JSON; outputs are hex-redacted; transition keys live
+  only in the actor's memory for the life of one transition).
+* SA generations are FORWARD-ONLY, and ambiguity is resolved by READ-ONLY
+  inspection of kernel truth (the helper's `report` mode on the Mac, the
+  fenced CAS on vprox) followed by a retry of the SAME target — never by
+  minting a fresh generation for an existing transition, and never by
+  deleting the target "to be safe".
+* The housekeeping sweep and the Mac GC step are counter-gated: nothing
+  superseded is deleted until the new generation provably carries packets,
+  plus a grace period.
 * Restart adoption (`RestoreIpipFromKernel`) never touches the xfrm state
   of adopted pairs — including when it deletes a rejected leftover iface
   that shares its remote with an adopted tunnel.
+* PF fail-closed before gif destruction: any teardown path where VMs may
+  still reference the gif installs and verifies per-VM drop guards first.
