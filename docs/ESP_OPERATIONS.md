@@ -16,9 +16,12 @@ instead of downgrading.
 
 Rolling back therefore means, in this order:
 
-1. **vprox box** — downgrade the binary (a `vprox.bak-*` copy next to the
-   deployed binary, `systemctl restart vprox`), then flush the kernel ESP
-   state:
+1. **vprox box** — downgrade the binary. The deploy playbook
+   (`setup_vprox_server.yaml`) preserves the previously running binary as
+   `~/vprox.bak-<date>` in the service user's home directory (next to the
+   `~/vprox` checkout it replaces) before each rebuild; copy it back over
+   `~/vprox/vprox` and `systemctl restart vprox`. Then flush the kernel
+   ESP state:
 
    ```
    ip xfrm state flush
@@ -48,14 +51,23 @@ Rolling back therefore means, in this order:
 
 ### How far back can the binary go?
 
-* Rolling back to a pre-ESP but IPIP-aware build keeps Mac static IP
-  working in plaintext (clients requesting `{"esp": true}` fall back:
-  the server ignores the field and answers with the plaintext response
-  shape, which the helper handles).
+* Rolling back to a pre-ESP but IPIP-aware build does NOT keep existing
+  tunnels flowing on its own: live pairs hold require-ESP kernel policies
+  on BOTH sides, and a downgraded server that answers `{"esp": true}` with
+  the plaintext response shape leaves those policies dropping every
+  plaintext IPIP packet. Traffic only flows again after the flush steps
+  above run on the vprox box AND each affected mini (after which fresh
+  setups negotiate plaintext and work). Rolling back the binary without
+  the flushes is a blackhole, not a downgrade.
 * Rolling back to pre-PR-18 main removes `/connect-ipip` entirely. Mac
   static IP is all-or-nothing on that endpoint: every Mac static-IP job
   in the fleet fails until the roll-forward. Do not do this to fix an
   ESP-only problem; use a plaintext-capable build plus the flushes above.
+* Rolling back across the forward-only rekey protocol boundary (PREPARE/
+  ACTIVATE/ABANDON) to the earlier switch-by-timeout rekey build is safe
+  for the dataplane (SAs in the kernel keep working), but in-flight
+  rotations are lost; the minis' next rekey tick re-negotiates from
+  scratch against whichever protocol the binary speaks.
 
 ## Accepted threat model
 
@@ -85,9 +97,16 @@ Related invariants the code maintains (do not regress):
 
 * Key material never appears in argv, logs, or error strings (helpers read
   secrets from stdin JSON; outputs are hex-redacted).
-* The rekey path is additive: a new generation is installed alongside the
-  old, the switch is confirmed by traffic counters, and rollback keeps the
-  previous generation decryptable on both sides.
+* SA generations are FORWARD-ONLY: no SA is ever deleted and re-added.
+  Re-adding an outbound SA resets its sequence counter while the peer's
+  inbound anti-replay high-water mark survives, so on a mature tunnel
+  every packet of the re-added generation is dropped as a replay. The
+  rekey protocol therefore proves the new generation carries traffic on
+  the wire (PREPARE -> client inbound install -> ACTIVATE policy flip ->
+  counter-verified proof) before the client abandons its old outbound
+  path, and each side retires old state only on kernel-counter evidence.
+  A failed rotation retries forward with a fresh generation, never by
+  resurrecting an old one.
 * Restart adoption (`RestoreIpipFromKernel`) never touches the xfrm state
   of adopted pairs — including when it deletes a rejected leftover iface
   that shares its remote with an adopted tunnel.
