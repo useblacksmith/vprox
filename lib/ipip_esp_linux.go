@@ -135,12 +135,33 @@ func (srv *Server) installIpipEsp(clientIP netip.Addr, ifname string, keys ipipE
 		return err
 	}
 
-	link, err := netlink.LinkByName(ifname)
+	// The SAs and require-ESP policies are now live in the kernel. Any
+	// failure past this point must unwind them: the handler returns an
+	// error to the client, so the client never receives the minted keys,
+	// and a pair left require-ESP'd without a key holder is a blackhole
+	// until a successful retry (see ipipEspFinishInstall).
+	err, unwindErr := ipipEspFinishInstall(
+		func() error {
+			link, err := netlink.LinkByName(ifname)
+			if err != nil {
+				return fmt.Errorf("lookup %s for esp mtu: %v", ifname, err)
+			}
+			if err := netlink.LinkSetMTU(link, ipipEspMtu); err != nil {
+				return fmt.Errorf("set %s mtu %d: %v", ifname, ipipEspMtu, err)
+			}
+			return nil
+		},
+		func() error { return srv.removeIpipEsp(clientIP) },
+	)
 	if err != nil {
-		return fmt.Errorf("lookup %s for esp mtu: %v", ifname, err)
-	}
-	if err := netlink.LinkSetMTU(link, ipipEspMtu); err != nil {
-		return fmt.Errorf("set %s mtu %d: %v", ifname, ipipEspMtu, err)
+		if unwindErr != nil {
+			log.Printf("[%v] esp unwind after failed install for %v (%s) also FAILED: %v; pair may be left require-ESP'd",
+				srv.BindAddr, clientIP, ifname, unwindErr)
+		} else {
+			log.Printf("[%v] esp install unwound for %v (%s) after post-install failure: %v",
+				srv.BindAddr, clientIP, ifname, err)
+		}
+		return err
 	}
 	return nil
 }

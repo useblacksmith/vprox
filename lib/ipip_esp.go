@@ -206,6 +206,21 @@ func ipipEspStatesToDelete(states []ipipEspStateKey, src, dst netip.Addr, keep m
 	return victims
 }
 
+// ipipEspFinishInstall runs finish (the post-xfrm steps of an ESP install:
+// iface lookup and MTU clamp) and, if it fails, unwinds the xfrm objects
+// that were already installed for the pair. The install must be
+// transactional: on failure the handler returns an error to the client, so
+// the client never receives the minted keys, and a pair left require-ESP'd
+// in the kernel with keys nobody holds blackholes all IPIP traffic until a
+// successful retry. The returned err is always the finish failure (nil on
+// success); unwindErr reports the unwind's own outcome for logging.
+func ipipEspFinishInstall(finish, unwind func() error) (err, unwindErr error) {
+	if err = finish(); err == nil {
+		return nil, nil
+	}
+	return err, unwind()
+}
+
 // ipipRequestBodyLimit bounds how much of the request body we read; the
 // legitimate body is a few bytes of JSON.
 const ipipRequestBodyLimit = 4096

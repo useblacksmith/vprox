@@ -2,6 +2,7 @@ package lib
 
 import (
 	"encoding/json"
+	"errors"
 	"net/netip"
 	"strings"
 	"testing"
@@ -140,6 +141,46 @@ func TestIpipEspStatesToDelete(t *testing.T) {
 			assert.NotEqual(t, other, v.Src)
 			assert.NotEqual(t, other, v.Dst)
 		}
+	})
+}
+
+// TestIpipEspFinishInstall pins the transactional-install contract: once
+// the xfrm objects are in the kernel, any later failure of the install
+// path must unwind them (the client never receives the keys, so leftover
+// require-ESP state would blackhole the pair).
+func TestIpipEspFinishInstall(t *testing.T) {
+	t.Run("success does not unwind", func(t *testing.T) {
+		unwound := false
+		err, unwindErr := ipipEspFinishInstall(
+			func() error { return nil },
+			func() error { unwound = true; return nil },
+		)
+		assert.NoError(t, err)
+		assert.NoError(t, unwindErr)
+		assert.False(t, unwound, "a successful install must keep its xfrm state")
+	})
+
+	t.Run("failure unwinds and returns the original error", func(t *testing.T) {
+		unwound := false
+		finishErr := errors.New("mtu set failed")
+		err, unwindErr := ipipEspFinishInstall(
+			func() error { return finishErr },
+			func() error { unwound = true; return nil },
+		)
+		assert.ErrorIs(t, err, finishErr)
+		assert.NoError(t, unwindErr)
+		assert.True(t, unwound, "xfrm objects must be removed when the install fails late")
+	})
+
+	t.Run("unwind failure is reported alongside", func(t *testing.T) {
+		finishErr := errors.New("iface lookup failed")
+		unwindFailure := errors.New("xfrm delete failed")
+		err, unwindErr := ipipEspFinishInstall(
+			func() error { return finishErr },
+			func() error { return unwindFailure },
+		)
+		assert.ErrorIs(t, err, finishErr, "the install failure stays the primary error")
+		assert.ErrorIs(t, unwindErr, unwindFailure)
 	})
 }
 
