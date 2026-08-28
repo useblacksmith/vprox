@@ -231,9 +231,9 @@ func parseIpipEspSpiHex(s string) (uint32, error) {
 // ipipEspStateKey identifies one kernel ESP state by direction, SPI, and
 // reqid. The sweep works on these instead of full xfrm states so the
 // selection logic is pure and testable off-Linux. AddTime is the kernel's
-// install timestamp (seconds since install), used to age orphan states;
-// it survives vprox restarts because it lives in the kernel, not in this
-// process.
+// install timestamp (absolute, seconds since the epoch -- xfrm
+// curlft.add_time), used to age orphan states; it survives vprox restarts
+// because it lives in the kernel, not in this process.
 type ipipEspStateKey struct {
 	Src     netip.Addr
 	Dst     netip.Addr
@@ -250,11 +250,12 @@ type ipipEspStateInfo struct {
 }
 
 // newestIpipEspToClientReqid returns the reqid of the newest (by kernel
-// AddTime, which counts seconds SINCE install -- smaller is newer) server->
-// client state other than excludeSpi. Used only to heal a missing outbound
-// policy: the policy template must select the generation the pair was
-// actually running on, and after a vprox restart the only source of truth
-// is the kernel. ok is false when the pair has no such state.
+// AddTime, an absolute install timestamp in seconds since the epoch --
+// larger is newer) server->client state other than excludeSpi. Used only
+// to heal a missing outbound policy: the policy template must select the
+// generation the pair was actually running on, and after a vprox restart
+// the only source of truth is the kernel. ok is false when the pair has
+// no such state.
 func newestIpipEspToClientReqid(states []ipipEspStateInfo, server, client netip.Addr, excludeSpi uint32) (reqid int, ok bool) {
 	var best ipipEspStateKey
 	found := false
@@ -262,7 +263,7 @@ func newestIpipEspToClientReqid(states []ipipEspStateInfo, server, client netip.
 		if s.Src != server || s.Dst != client || s.Spi == excludeSpi {
 			continue
 		}
-		if !found || s.AddTime < best.AddTime {
+		if !found || s.AddTime > best.AddTime {
 			best = s.ipipEspStateKey
 			found = true
 		}
@@ -430,9 +431,12 @@ func planEspSweep(in espSweepPeerInput) espSweepPlan {
 				continue
 			}
 			// Orphan path: no transition references this state and no
-			// bookkeeping exists to gate on -- age it out on kernel truth.
-			if in.ActivatedAt.IsZero() && !pendingSet &&
-				time.Duration(s.AddTime)*time.Second > in.PendingDeadline {
+			// bookkeeping exists to gate on -- age it out on kernel truth
+			// (AddTime is the absolute install timestamp). The deadline
+			// protects a transition prepared moments before a restart
+			// whose activate arrives right after.
+			if in.ActivatedAt.IsZero() && !pendingSet && s.AddTime > 0 &&
+				in.Now.Sub(time.Unix(int64(s.AddTime), 0)) > in.PendingDeadline {
 				plan.Deletions = append(plan.Deletions, s.ipipEspStateKey)
 			}
 		case s.Src == in.Client && s.Dst == in.Server: // inbound

@@ -167,8 +167,8 @@ func TestPlanEspSweepStableIsUntouched(t *testing.T) {
 	in := baseSweepInput()
 	in.ActiveSpiToServer = 0x200
 	in.States = []ipipEspStateInfo{
-		sweepState(sweepClient, sweepServer, 0x200, 0, 3600, 12345),
-		sweepState(sweepServer, sweepClient, 0x201, 0x201, 3600, 12345),
+		sweepState(sweepClient, sweepServer, 0x200, 0, 6400, 12345),
+		sweepState(sweepServer, sweepClient, 0x201, 0x201, 6400, 12345),
 	}
 	plan := planEspSweep(in)
 	assert.False(t, plan.ReapPending)
@@ -183,10 +183,10 @@ func TestPlanEspSweepPendingWithinDeadlinePinned(t *testing.T) {
 	in.PendingSpiToServer, in.PendingSpiToClient = 0x300, 0x301
 	in.PreparedAt = in.Now.Add(-time.Minute)
 	in.States = []ipipEspStateInfo{
-		sweepState(sweepClient, sweepServer, 0x200, 0, 3600, 12345),
-		sweepState(sweepServer, sweepClient, 0x201, 0x201, 3600, 12345),
-		sweepState(sweepClient, sweepServer, 0x300, 0, 60, 0),
-		sweepState(sweepServer, sweepClient, 0x301, 0x301, 60, 0),
+		sweepState(sweepClient, sweepServer, 0x200, 0, 6400, 12345),
+		sweepState(sweepServer, sweepClient, 0x201, 0x201, 6400, 12345),
+		sweepState(sweepClient, sweepServer, 0x300, 0, 9940, 0),
+		sweepState(sweepServer, sweepClient, 0x301, 0x301, 9940, 0),
 	}
 	plan := planEspSweep(in)
 	assert.False(t, plan.ReapPending)
@@ -201,10 +201,10 @@ func TestPlanEspSweepPendingReapAfterDeadline(t *testing.T) {
 	in.PendingSpiToServer, in.PendingSpiToClient = 0x300, 0x301
 	in.PreparedAt = in.Now.Add(-6 * time.Minute)
 	in.States = []ipipEspStateInfo{
-		sweepState(sweepClient, sweepServer, 0x200, 0, 3600, 12345),
-		sweepState(sweepServer, sweepClient, 0x201, 0x201, 3600, 12345),
-		sweepState(sweepClient, sweepServer, 0x300, 0, 400, 0),
-		sweepState(sweepServer, sweepClient, 0x301, 0x301, 400, 0),
+		sweepState(sweepClient, sweepServer, 0x200, 0, 6400, 12345),
+		sweepState(sweepServer, sweepClient, 0x201, 0x201, 6400, 12345),
+		sweepState(sweepClient, sweepServer, 0x300, 0, 9600, 0),
+		sweepState(sweepServer, sweepClient, 0x301, 0x301, 9600, 0),
 	}
 	plan := planEspSweep(in)
 	assert.True(t, plan.ReapPending)
@@ -218,12 +218,12 @@ func TestPlanEspSweepGcCounterGated(t *testing.T) {
 	in.ActiveSpiToServer = 0x200
 	in.ActivatedAt = in.Now.Add(-3 * time.Minute) // grace elapsed
 	old := []ipipEspStateInfo{
-		sweepState(sweepClient, sweepServer, 0x100, 0, 7200, 999999),     // superseded inbound
-		sweepState(sweepServer, sweepClient, 0x101, 0x101, 7200, 999999), // superseded outbound
+		sweepState(sweepClient, sweepServer, 0x100, 0, 2800, 999999),     // superseded inbound
+		sweepState(sweepServer, sweepClient, 0x101, 0x101, 2800, 999999), // superseded outbound
 	}
 	active := []ipipEspStateInfo{
-		sweepState(sweepClient, sweepServer, 0x200, 0, 200, 0), // no packets yet!
-		sweepState(sweepServer, sweepClient, 0x201, 0x201, 200, 50),
+		sweepState(sweepClient, sweepServer, 0x200, 0, 9800, 0), // no packets yet!
+		sweepState(sweepServer, sweepClient, 0x201, 0x201, 9800, 50),
 	}
 	in.States = append(old, active...)
 
@@ -249,9 +249,9 @@ func TestPlanEspSweepCounterUnknownSkips(t *testing.T) {
 	in.ActivatedAt = in.Now.Add(-time.Hour)
 	in.States = []ipipEspStateInfo{
 		// Active inbound 0x200 absent from the dump.
-		sweepState(sweepClient, sweepServer, 0x100, 0, 7200, 999999),
-		sweepState(sweepServer, sweepClient, 0x101, 0x101, 7200, 999999),
-		sweepState(sweepServer, sweepClient, 0x201, 0x201, 200, 50),
+		sweepState(sweepClient, sweepServer, 0x100, 0, 2800, 999999),
+		sweepState(sweepServer, sweepClient, 0x101, 0x101, 2800, 999999),
+		sweepState(sweepServer, sweepClient, 0x201, 0x201, 9800, 50),
 	}
 	plan := planEspSweep(in)
 	assert.Empty(t, plan.Deletions)
@@ -265,11 +265,11 @@ func TestPlanEspSweepUnknownActiveInboundNeverDeletesInbounds(t *testing.T) {
 	in := baseSweepInput()
 	in.ActiveSpiToServer = 0 // restart: unknown
 	in.States = []ipipEspStateInfo{
-		sweepState(sweepClient, sweepServer, 0x100, 0, 7200, 10),
-		sweepState(sweepClient, sweepServer, 0x200, 0, 3600, 10),
-		sweepState(sweepServer, sweepClient, 0x201, 0x201, 3600, 10), // policy-selected
-		sweepState(sweepServer, sweepClient, 0x101, 0x101, 7200, 10), // orphan outbound, old
-		sweepState(sweepServer, sweepClient, 0x301, 0x301, 30, 0),    // orphan outbound, young
+		sweepState(sweepClient, sweepServer, 0x100, 0, 2800, 10),
+		sweepState(sweepClient, sweepServer, 0x200, 0, 6400, 10),
+		sweepState(sweepServer, sweepClient, 0x201, 0x201, 6400, 10), // policy-selected
+		sweepState(sweepServer, sweepClient, 0x101, 0x101, 2800, 10), // orphan outbound, old
+		sweepState(sweepServer, sweepClient, 0x301, 0x301, 9970, 0),  // orphan outbound, young
 	}
 	plan := planEspSweep(in)
 	assert.ElementsMatch(t, []uint32{0x101}, planSpis(plan),
@@ -284,10 +284,10 @@ func TestPlanEspSweepMissingPolicySkipsGc(t *testing.T) {
 	in.ActiveSpiToServer = 0x200
 	in.ActivatedAt = in.Now.Add(-time.Hour)
 	in.States = []ipipEspStateInfo{
-		sweepState(sweepClient, sweepServer, 0x100, 0, 7200, 10),
-		sweepState(sweepServer, sweepClient, 0x101, 0x101, 7200, 10),
-		sweepState(sweepClient, sweepServer, 0x200, 0, 3600, 10),
-		sweepState(sweepServer, sweepClient, 0x201, 0x201, 3600, 10),
+		sweepState(sweepClient, sweepServer, 0x100, 0, 2800, 10),
+		sweepState(sweepServer, sweepClient, 0x101, 0x101, 2800, 10),
+		sweepState(sweepClient, sweepServer, 0x200, 0, 6400, 10),
+		sweepState(sweepServer, sweepClient, 0x201, 0x201, 6400, 10),
 	}
 	plan := planEspSweep(in)
 	assert.Empty(t, plan.Deletions)
@@ -307,26 +307,26 @@ func TestPlanEspSweepOtherPairsNeverTouched(t *testing.T) {
 	in.ActiveSpiToServer = 0x200
 	in.ActivatedAt = in.Now.Add(-time.Hour)
 	in.States = []ipipEspStateInfo{
-		sweepState(sweepClient, sweepServer, 0x200, 0, 3600, 10),
-		sweepState(sweepServer, sweepClient, 0x201, 0x201, 3600, 10),
-		sweepState(other, sweepServer, 0x999, 0, 7200, 10),
-		sweepState(sweepServer, other, 0x998, 0x998, 7200, 10),
+		sweepState(sweepClient, sweepServer, 0x200, 0, 6400, 10),
+		sweepState(sweepServer, sweepClient, 0x201, 0x201, 6400, 10),
+		sweepState(other, sweepServer, 0x999, 0, 2800, 10),
+		sweepState(sweepServer, other, 0x998, 0x998, 2800, 10),
 	}
 	plan := planEspSweep(in)
 	assert.Empty(t, plan.Deletions)
 }
 
 // TestNewestIpipEspToClientReqid pins the policy-heal selection: newest by
-// kernel AddTime (seconds SINCE install; smaller is newer), excluding the
+// kernel AddTime (absolute install timestamp; larger is newer), excluding the
 // just-prepared generation.
 func TestNewestIpipEspToClientReqid(t *testing.T) {
 	other := netip.MustParseAddr("192.0.2.3")
 	aged := []ipipEspStateInfo{
-		sweepState(sweepServer, sweepClient, 0x101, 0, 300, 0),     // legacy gen, oldest
+		sweepState(sweepServer, sweepClient, 0x101, 0, 100, 0),     // legacy gen, oldest
 		sweepState(sweepServer, sweepClient, 0x201, 0x201, 200, 0), // current gen
-		sweepState(sweepServer, sweepClient, 0x301, 0x301, 100, 0), // freshly prepared
-		sweepState(sweepClient, sweepServer, 0x200, 0, 150, 0),     // inbound: never a candidate
-		sweepState(sweepServer, other, 0x998, 0x998, 10, 0),        // different pair
+		sweepState(sweepServer, sweepClient, 0x301, 0x301, 300, 0), // freshly prepared
+		sweepState(sweepClient, sweepServer, 0x200, 0, 250, 0),     // inbound: never a candidate
+		sweepState(sweepServer, other, 0x998, 0x998, 999, 0),       // different pair
 	}
 	reqid, ok := newestIpipEspToClientReqid(aged, sweepServer, sweepClient, 0x301)
 	assert.True(t, ok)
