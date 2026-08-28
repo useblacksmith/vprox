@@ -65,6 +65,48 @@ func TestConnectIpipRequestValidate(t *testing.T) {
 	assert.NoError(t, connectIpipRequest{Esp: true, Rekey: true}.validate())
 	assert.Error(t, connectIpipRequest{Rekey: true}.validate(),
 		"rekey without esp has no defined semantics")
+
+	assert.NoError(t, connectIpipRequest{Esp: true, Rekey: true, Activate: "c0ffee42"}.validate())
+	assert.NoError(t, connectIpipRequest{Esp: true, Rekey: true, Abandon: "c0ffee42"}.validate())
+	assert.Error(t, connectIpipRequest{Esp: true, Activate: "c0ffee42"}.validate(),
+		"activate requires rekey")
+	assert.Error(t, connectIpipRequest{Esp: true, Rekey: true, Activate: "a", Abandon: "b"}.validate(),
+		"activate and abandon are mutually exclusive")
+	assert.Error(t, connectIpipRequest{Esp: true, Rekey: true, Activate: "zzzz"}.validate(),
+		"non-hex SPI rejected")
+	assert.Error(t, connectIpipRequest{Esp: true, Rekey: true, Activate: "0"}.validate(),
+		"zero SPI rejected")
+	assert.Error(t, connectIpipRequest{Esp: true, Rekey: true, Activate: "100000000"}.validate(),
+		"SPI wider than 32 bits rejected")
+}
+
+func TestParseIpipEspSpiHex(t *testing.T) {
+	spi, err := parseIpipEspSpiHex("c0ffee42")
+	require.NoError(t, err)
+	assert.Equal(t, uint32(0xc0ffee42), spi)
+	_, err = parseIpipEspSpiHex("")
+	assert.Error(t, err)
+	_, err = parseIpipEspSpiHex("0")
+	assert.Error(t, err)
+}
+
+// TestIpipPeerGenerationBookkeeping pins the pure peer-side state
+// transitions of the rotation protocol.
+func TestIpipPeerGenerationBookkeeping(t *testing.T) {
+	p := &ipipPeer{}
+	p.setActiveEspGeneration(0x100, 0x101)
+	assert.Equal(t, uint32(0x100), p.espSpiToServer)
+	assert.Equal(t, uint32(0x101), p.espSpiToClient)
+	assert.Zero(t, p.espPendingSpiToServer)
+	assert.Zero(t, p.espPrevSpiToServer)
+	assert.False(t, p.espPrevReqidValid)
+
+	p.espPendingSpiToServer, p.espPendingSpiToClient = 0x200, 0x201
+	p.espPrevReqid, p.espPrevReqidValid = 0x42, true
+	p.clearEspGenerations()
+	assert.Zero(t, p.espSpiToServer)
+	assert.Zero(t, p.espPendingSpiToClient)
+	assert.False(t, p.espPrevReqidValid)
 }
 
 func TestIpipEspStatesToDelete(t *testing.T) {
@@ -116,23 +158,26 @@ func TestIpipEspStatesToDelete(t *testing.T) {
 		}
 	})
 
-	t.Run("newest previous inbound is protected", func(t *testing.T) {
+	t.Run("policy heal picks the newest outbound generation", func(t *testing.T) {
 		aged := []ipipEspStateKey{
-			{Src: client, Dst: server, Spi: 0x100, AddTime: 100}, // oldest
-			{Src: client, Dst: server, Spi: 0x200, AddTime: 200}, // rollback target
-			{Src: client, Dst: server, Spi: 0x300, AddTime: 300}, // freshly minted
-			{Src: server, Dst: client, Spi: 0x201, AddTime: 200}, // outbound: never a candidate
-			{Src: other, Dst: server, Spi: 0x999, AddTime: 999},  // different pair
+			{Src: server, Dst: client, Spi: 0x101, Reqid: 0, AddTime: 100},     // legacy gen
+			{Src: server, Dst: client, Spi: 0x201, Reqid: 0x201, AddTime: 200}, // current gen
+			{Src: server, Dst: client, Spi: 0x301, Reqid: 0x301, AddTime: 300}, // freshly prepared
+			{Src: client, Dst: server, Spi: 0x200, Reqid: 0, AddTime: 250},     // inbound: never a candidate
+			{Src: server, Dst: other, Spi: 0x998, Reqid: 0x998, AddTime: 999},  // different pair
 		}
-		assert.Equal(t, uint32(0x200),
-			newestIpipEspInboundSpi(aged, client, server, 0x300),
-			"newest inbound excluding the just-minted generation")
-		assert.Equal(t, uint32(0x300),
-			newestIpipEspInboundSpi(aged, client, server, 0),
-			"without exclusion the newest inbound wins")
-		assert.Equal(t, uint32(0),
-			newestIpipEspInboundSpi(nil, client, server, 0),
-			"no states -> no protected generation")
+		reqid, ok := newestIpipEspToClientReqid(aged, server, client, 0x301)
+		assert.True(t, ok)
+		assert.Equal(t, 0x201, reqid,
+			"newest outbound excluding the just-prepared generation")
+
+		reqid, ok = newestIpipEspToClientReqid(aged[:1], server, client, 0)
+		assert.True(t, ok)
+		assert.Equal(t, 0, reqid,
+			"a legacy generation heals to a reqid-0 template, which selects it")
+
+		_, ok = newestIpipEspToClientReqid(nil, server, client, 0)
+		assert.False(t, ok, "no states -> nothing to heal to")
 	})
 
 	t.Run("other pairs never selected", func(t *testing.T) {

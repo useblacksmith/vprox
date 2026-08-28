@@ -119,6 +119,19 @@ type Server struct {
 	ipipMu     sync.Mutex
 	ipipPeers  map[netip.Addr]*ipipPeer
 	ipipClosed bool // set by CleanupIpip; lookupOrCreateIpip refuses new tunnels
+
+	// espEpochCounter is the process-global source for ipipPeer
+	// espRekeyEpoch values. Guarded by ipipMu. Monotonic, so an epoch
+	// captured by a background goroutine can never be observed again once
+	// superseded -- even across peer re-creation for the same client IP.
+	espEpochCounter uint64
+}
+
+// nextEspEpochLocked returns the next ESP rekey epoch. Caller must hold
+// ipipMu.
+func (srv *Server) nextEspEpochLocked() uint64 {
+	srv.espEpochCounter++
+	return srv.espEpochCounter
 }
 
 // InitState initializes the private server state.

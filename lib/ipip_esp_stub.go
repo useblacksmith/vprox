@@ -20,6 +20,14 @@ func (srv *Server) removeIpipEsp(clientIP netip.Addr) error {
 	return nil
 }
 
-func (srv *Server) rekeyIpipEsp(p *ipipPeer, keys ipipEspKeys) error {
-	return errors.New("ipip esp rekey requires linux xfrm")
+func (srv *Server) prepareIpipEspRekey(p *ipipPeer, keys ipipEspKeys) (bool, error) {
+	return false, errors.New("ipip esp rekey requires linux xfrm")
+}
+
+func (srv *Server) activateIpipEsp(p *ipipPeer, spiToClient uint32) error {
+	return errors.New("ipip esp activate requires linux xfrm")
+}
+
+func (srv *Server) abandonIpipEsp(p *ipipPeer, spiToClient uint32) error {
+	return errors.New("ipip esp abandon requires linux xfrm")
 }

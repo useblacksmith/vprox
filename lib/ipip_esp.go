@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
+	"strconv"
 )
 
 // ESP for IPIP tunnels.
@@ -22,24 +23,46 @@ import (
 //
 // Rekey. The SAs have no lifetimes and no ESN (macOS setkey cannot install
 // ESN), so a non-ESN SA hard-stops at seq 2^32; clients must rotate SA
-// generations before that. {"esp": true, "rekey": true} is the rotation
-// request: the server mints a fresh generation, installs only its new
-// INBOUND (client->server) SA alongside the existing ones, and returns the
-// material. Its outbound is switched to the new generation by a background
-// poll once the new inbound SA's packet counter first ticks (i.e. the
-// client demonstrably transmits on the new generation), or after a timeout.
-// Old generations are garbage-collected a grace period after a
-// counter-confirmed switch; a timeout-switch skips GC because the client
-// may have rolled back to the previous generation (its health check
-// failed), and deleting that generation's inbound SA would cut it off. The
-// GC sweep is list-based (delete everything for the pair except the
-// current generation), so it also collects generations orphaned by a vprox
-// restart losing the in-memory map.
+// generations before that. Generations are FORWARD-ONLY: no SA is ever
+// deleted and re-added (re-adding an outbound SA resets its sequence
+// counter to zero while the peer's inbound anti-replay high-water mark
+// survives, so every packet on the re-added SA is dropped as a replay on a
+// mature tunnel). The client drives a three-step rotation:
+//
+//	PREPARE  {"esp":true,"rekey":true}: mint generation N+1, install BOTH
+//	         its states -- the new inbound (client->server, reqid 0 like
+//	         every inbound) and the new outbound (server->client) under a
+//	         fresh reqid -- WITHOUT flipping the outbound policy. The
+//	         kernel keeps emitting generation N (xfrm policy templates
+//	         select states by exact reqid match), and every old state is
+//	         untouched. The minted material is returned to the client.
+//	ACTIVATE {"esp":true,"rekey":true,"activate":"<SpiToClient hex>"}:
+//	         after the client has installed its inbound for N+1, flip the
+//	         outbound policy template to N+1's reqid. The old outbound
+//	         STATE is retained, so the flip is reversible without replay
+//	         damage (Linux resumes the old state's sequence counter).
+//	         Idempotent, keyed by the generation's SpiToClient.
+//	ABANDON  {"esp":true,"rekey":true,"abandon":"<SpiToClient hex>"}:
+//	         the client's on-the-wire proof of N+1 failed. If N+1 is still
+//	         pending, its two states are deleted (nothing else changes).
+//	         If N+1 was activated, the outbound policy is flipped back to
+//	         the previous generation's reqid; the abandoned states stay
+//	         installed until the next successful rotation's GC sweeps them.
+//
+// GC is gated on dataplane evidence, never wall clock alone: after an
+// ACTIVATE, a background poll watches the new inbound SA's packet counter
+// (the client's post-switch health check produces those packets); only
+// once it ticks -- proof the client transmits on N+1 -- are the pair's
+// other generations swept, after a grace period. On poll timeout nothing
+// is deleted; the next successful rotation's sweep collects stragglers. A
+// pending generation the client never activates is reaped after a timeout
+// (or replaced by the next PREPARE) without touching active state.
 //
 // A plain {"esp": true} (no rekey) keeps the original destructive-replace
 // semantics for fresh connects: delete every SA for the pair, install one
-// new generation. A rekey request for a pair with no live SAs falls back
-// to that same full install.
+// new generation. A PREPARE for a pair with no live server->client SA
+// falls back to that same full install and reports Fresh=true so the
+// client knows the pair was rebuilt rather than rotated.
 
 // ipipEspAlgorithm is the transform used for IPIP ESP, as a wire-protocol
 // name shared with the Mac client: AES-128-CBC encryption with
@@ -133,11 +156,15 @@ func mintIpipEspSpi() (uint32, error) {
 
 // connectIpipRequest is the (optional) JSON body of POST /connect-ipip.
 // Old clients send an empty body or {} and get plaintext IPIP. Rekey asks
-// for an additive SA-generation rotation instead of a destructive replace;
-// it is only meaningful with Esp (see validate).
+// for an additive SA-generation PREPARE instead of a destructive replace;
+// Activate and Abandon are the follow-up steps of the forward-only
+// rotation, each carrying the target generation's SpiToClient as lowercase
+// hex (see the package comment). All three are only meaningful with Esp.
 type connectIpipRequest struct {
-	Esp   bool `json:"esp"`
-	Rekey bool `json:"rekey"`
+	Esp      bool   `json:"esp"`
+	Rekey    bool   `json:"rekey"`
+	Activate string `json:"activate,omitempty"`
+	Abandon  string `json:"abandon,omitempty"`
 }
 
 // validate rejects request combinations that have no defined semantics.
@@ -145,34 +172,59 @@ func (r connectIpipRequest) validate() error {
 	if r.Rekey && !r.Esp {
 		return fmt.Errorf("rekey requires esp")
 	}
+	if (r.Activate != "" || r.Abandon != "") && !(r.Esp && r.Rekey) {
+		return fmt.Errorf("activate/abandon require esp and rekey")
+	}
+	if r.Activate != "" && r.Abandon != "" {
+		return fmt.Errorf("activate and abandon are mutually exclusive")
+	}
+	for _, s := range []string{r.Activate, r.Abandon} {
+		if s == "" {
+			continue
+		}
+		if _, err := parseIpipEspSpiHex(s); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-// ipipEspStateKey identifies one kernel ESP state by direction and SPI.
-// The rekey switch and GC paths work on these instead of full xfrm states
+// parseIpipEspSpiHex parses a generation's SpiToClient as sent by the
+// client in activate/abandon requests.
+func parseIpipEspSpiHex(s string) (uint32, error) {
+	v, err := strconv.ParseUint(s, 16, 32)
+	if err != nil || v == 0 {
+		return 0, fmt.Errorf("invalid ESP SPI %q", s)
+	}
+	return uint32(v), nil
+}
+
+// ipipEspStateKey identifies one kernel ESP state by direction, SPI, and
+// reqid. The rekey and GC paths work on these instead of full xfrm states
 // so the selection logic is pure and testable off-Linux. AddTime is the
-// kernel's install timestamp (seconds), used to pick the newest previous
-// inbound generation; it survives vprox restarts because it lives in the
-// kernel, not in this process.
+// kernel's install timestamp (seconds), used to pick the newest existing
+// generation when healing a lost outbound policy; it survives vprox
+// restarts because it lives in the kernel, not in this process.
 type ipipEspStateKey struct {
 	Src     netip.Addr
 	Dst     netip.Addr
 	Spi     uint32
+	Reqid   int
 	AddTime uint64
 }
 
-// newestIpipEspInboundSpi returns the SPI of the newest (by kernel
-// AddTime) client->server state other than excludeSpi, or 0 if none. A
-// rekey protects this generation from the post-switch GC: the client's
-// rollback path returns its outbound to exactly this generation, and
-// "vprox keeps accepting both" is the rollback contract. Using kernel
-// AddTime (not in-memory bookkeeping) keeps the choice correct across
-// vprox restarts.
-func newestIpipEspInboundSpi(states []ipipEspStateKey, client, server netip.Addr, excludeSpi uint32) uint32 {
+// newestIpipEspToClientReqid returns the reqid of the newest (by kernel
+// AddTime) server->client state other than excludeSpi. Used only to heal a
+// missing outbound policy: the policy template must select the generation
+// the pair was actually running on, and after a vprox restart the only
+// source of truth is the kernel. Legacy states (installed before reqid'd
+// generations) carry reqid 0, which is exactly the template value that
+// selects them. ok is false when the pair has no such state.
+func newestIpipEspToClientReqid(states []ipipEspStateKey, server, client netip.Addr, excludeSpi uint32) (reqid int, ok bool) {
 	var best ipipEspStateKey
 	found := false
 	for _, s := range states {
-		if s.Src != client || s.Dst != server || s.Spi == excludeSpi {
+		if s.Src != server || s.Dst != client || s.Spi == excludeSpi {
 			continue
 		}
 		if !found || s.AddTime > best.AddTime {
@@ -180,10 +232,7 @@ func newestIpipEspInboundSpi(states []ipipEspStateKey, client, server netip.Addr
 			found = true
 		}
 	}
-	if !found {
-		return 0
-	}
-	return best.Spi
+	return best.Reqid, found
 }
 
 // ipipEspStatesToDelete returns the states flowing src->dst whose SPI is

@@ -26,14 +26,33 @@ const ipProtoIpip = 4
 // wildcard --clamp-mss-to-pmtu MSS rules pick this up automatically.
 const ipipEspMtu = 1424
 
+// ipipEspReqid returns the xfrm reqid for a generation, derived from its
+// SpiToClient. reqids exist to make OUTBOUND state selection deterministic
+// and reversible: the out-policy template selects states by EXACT reqid
+// match (verified on staging: a tmpl reqid never matches a state with a
+// different reqid, including 0), so multiple outbound generations coexist
+// and a policy update flips emission between them without deleting
+// anything -- and without resetting sequence counters, which makes the
+// flip replay-safe. Deriving the reqid from the SPI (instead of a counter)
+// keeps it recoverable after a vprox restart from kernel state alone.
+//
+// Inbound states and the in-policy template always use reqid 0: inbound
+// policy checks also require an exact reqid match between the decrypting
+// SA and the template, and the whole point of the rotation protocol is
+// that EVERY installed inbound generation stays acceptable at once.
+func ipipEspReqid(spiToClient uint32) int {
+	return int(spiToClient)
+}
+
 // ipipEspXfrmState builds one transport-mode ESP xfrm state.
-func ipipEspXfrmState(src, dst netip.Addr, sa ipipEspSA) *netlink.XfrmState {
+func ipipEspXfrmState(src, dst netip.Addr, sa ipipEspSA, reqid int) *netlink.XfrmState {
 	return &netlink.XfrmState{
 		Src:          addrToIp(src),
 		Dst:          addrToIp(dst),
 		Proto:        netlink.XFRM_PROTO_ESP,
 		Mode:         netlink.XFRM_MODE_TRANSPORT,
 		Spi:          int(sa.Spi),
+		Reqid:        reqid,
 		ReplayWindow: 32,
 		Crypt: &netlink.XfrmStateAlgo{
 			Name: "cbc(aes)",
@@ -51,10 +70,12 @@ func ipipEspXfrmState(src, dst netip.Addr, sa ipipEspSA) *netlink.XfrmState {
 }
 
 // ipipEspStates returns the two transport-mode SAs for a client pair, in
-// (to-server, to-client) order.
+// (to-server, to-client) order. The to-client (outbound) state carries the
+// generation's reqid; the to-server (inbound) state carries reqid 0 like
+// every inbound generation (see ipipEspReqid).
 func (srv *Server) ipipEspStates(clientIP netip.Addr, keys ipipEspKeys) (toServer, toClient *netlink.XfrmState) {
-	toServer = ipipEspXfrmState(clientIP, srv.BindAddr, keys.ToServer)
-	toClient = ipipEspXfrmState(srv.BindAddr, clientIP, keys.ToClient)
+	toServer = ipipEspXfrmState(clientIP, srv.BindAddr, keys.ToServer, 0)
+	toClient = ipipEspXfrmState(srv.BindAddr, clientIP, keys.ToClient, ipipEspReqid(keys.ToClient.Spi))
 	return toServer, toClient
 }
 
@@ -64,7 +85,11 @@ func (srv *Server) ipipEspStates(clientIP netip.Addr, keys ipipEspKeys) (toServe
 // channel (TCP 443) between the same pair must stay reachable without ESP,
 // otherwise a client could never re-key. A non-optional template means
 // plaintext IPIP matching the selector is dropped, not passed through.
-func (srv *Server) ipipEspPolicies(clientIP netip.Addr) (in, out *netlink.XfrmPolicy) {
+//
+// outReqid pins which outbound generation the kernel emits (see
+// ipipEspReqid); the in policy always uses reqid 0 so every installed
+// inbound generation is accepted.
+func (srv *Server) ipipEspPolicies(clientIP netip.Addr, outReqid int) (in, out *netlink.XfrmPolicy) {
 	server := addrToIp(srv.BindAddr)
 	client := addrToIp(clientIP)
 	serverNet := prefixToIPNet(netip.PrefixFrom(srv.BindAddr, 32))
@@ -91,9 +116,28 @@ func (srv *Server) ipipEspPolicies(clientIP netip.Addr) (in, out *netlink.XfrmPo
 			Dst:   client,
 			Proto: netlink.XFRM_PROTO_ESP,
 			Mode:  netlink.XFRM_MODE_TRANSPORT,
+			Reqid: outReqid,
 		}},
 	}
 	return in, out
+}
+
+// outboundIpipEspPolicyReqid reads the pair's outbound require-ESP policy
+// from the kernel and returns its template reqid. found is false when the
+// policy does not exist.
+func (srv *Server) outboundIpipEspPolicyReqid(clientIP netip.Addr) (reqid int, found bool, err error) {
+	_, out := srv.ipipEspPolicies(clientIP, 0)
+	pol, err := netlink.XfrmPolicyGet(out)
+	if err != nil {
+		if xfrmNotFound(err) {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("get outbound esp policy: %v", err)
+	}
+	if len(pol.Tmpls) == 0 {
+		return 0, true, nil
+	}
+	return pol.Tmpls[0].Reqid, true, nil
 }
 
 // installIpipEsp installs the freshly minted SA pair and require-ESP
@@ -108,7 +152,7 @@ func (srv *Server) installIpipEsp(clientIP netip.Addr, ifname string, keys ipipE
 	}
 
 	toServer, toClient := srv.ipipEspStates(clientIP, keys)
-	polIn, polOut := srv.ipipEspPolicies(clientIP)
+	polIn, polOut := srv.ipipEspPolicies(clientIP, ipipEspReqid(keys.ToClient.Spi))
 
 	install := func() error {
 		if err := netlink.XfrmStateAdd(toServer); err != nil {
@@ -169,9 +213,10 @@ func (srv *Server) installIpipEsp(clientIP netip.Addr, ifname string, keys ipipE
 // removeIpipEsp removes the pair's require-ESP policies and every ESP SA
 // between srv.BindAddr and clientIP. Missing objects are not an error, so
 // this is safe to call for peers that never had ESP (plaintext requests and
-// teardown call it unconditionally).
+// teardown call it unconditionally). Policy deletion is keyed by selector
+// and direction, so the template reqid passed here is irrelevant.
 func (srv *Server) removeIpipEsp(clientIP netip.Addr) error {
-	polIn, polOut := srv.ipipEspPolicies(clientIP)
+	polIn, polOut := srv.ipipEspPolicies(clientIP, 0)
 	var errs []error
 	for _, pol := range []*netlink.XfrmPolicy{polIn, polOut} {
 		if err := netlink.XfrmPolicyDel(pol); err != nil && !xfrmNotFound(err) {
@@ -222,34 +267,42 @@ func xfrmNotFound(err error) bool {
 	return errors.Is(err, syscall.ESRCH) || errors.Is(err, syscall.ENOENT)
 }
 
-// Rekey timing. The switch poll watches the new inbound SA for its first
-// packet -- the client installs and starts using the new generation within
-// its own rekey step (seconds), so 60s of 500ms polls is generous. The GC
-// grace lets in-flight packets on the old generation drain (and gives the
-// client time to finish its own switch bookkeeping) before old states are
-// deleted.
+// Rekey timing. The GC gate poll watches the newly activated generation's
+// inbound SA for its first packet -- the client switches its outbound and
+// health-checks within seconds of ACTIVATE, so 60s of 500ms polls is
+// generous; on timeout NOTHING is deleted (the next successful rotation's
+// sweep collects stragglers). The GC grace lets in-flight packets on the
+// old generation drain before old states are deleted. The pending reap
+// deletes a PREPAREd generation the client never activated or abandoned
+// (helper died mid-protocol); it fires well after any legitimate
+// in-protocol gap, and only if no other request touched the pair since.
 const (
-	ipipEspSwitchPoll    = 500 * time.Millisecond
-	ipipEspSwitchTimeout = 60 * time.Second
+	ipipEspGcGatePoll    = 500 * time.Millisecond
+	ipipEspGcGateTimeout = 60 * time.Second
 	ipipEspGcGrace       = 2 * time.Minute
+	ipipEspPendingReap   = 5 * time.Minute
 )
 
-// rekeyIpipEsp rotates the pair's SA generation. Caller must hold ipipMu
-// and have minted keys (and bumped p.espRekeyEpoch). It installs only the
-// new INBOUND (client->server) SA next to the existing generation(s) and
-// re-asserts the require-ESP policies; the outbound switch happens in a
-// background poll once the client demonstrably transmits on the new
-// generation (see ipipEspSwitchLoop). The pair therefore always has a
-// working generation in both directions: old outbound keeps flowing until
-// the new inbound proves live.
+// prepareIpipEspRekey is the PREPARE step of the forward-only rotation.
+// Caller must hold ipipMu and have minted keys (and re-assigned
+// p.espRekeyEpoch). It installs BOTH of the new generation's states -- the
+// inbound next to every existing inbound, and the outbound under the
+// generation's fresh reqid, which the (untouched) outbound policy does not
+// select -- so nothing changes on the wire: the pair keeps flowing on the
+// active generation in both directions. A later ACTIVATE flips emission.
+//
+// A previously prepared-but-never-activated generation is deleted first
+// (its replacement is this call); a reap goroutine handles the case where
+// no next PREPARE ever comes.
 //
 // If the pair has no live outbound SA (fresh connect that asked for rekey,
-// or state lost some other way), this falls back to the destructive full
-// install -- there is nothing to hand over from.
-func (srv *Server) rekeyIpipEsp(p *ipipPeer, keys ipipEspKeys) error {
+// or a rebooted box that lost kernel state), this falls back to the
+// destructive full install and reports fresh=true -- there is nothing to
+// hand over from, and the client must know its old generation is gone.
+func (srv *Server) prepareIpipEspRekey(p *ipipPeer, keys ipipEspKeys) (fresh bool, err error) {
 	states, err := srv.listIpipEspStateKeys()
 	if err != nil {
-		return fmt.Errorf("list esp states for rekey: %v", err)
+		return false, fmt.Errorf("list esp states for rekey: %v", err)
 	}
 	live := false
 	for _, s := range states {
@@ -262,145 +315,254 @@ func (srv *Server) rekeyIpipEsp(p *ipipPeer, keys ipipEspKeys) error {
 		log.Printf("[%v] esp rekey requested for %v (%s) without live SAs; performing full install",
 			srv.BindAddr, p.clientIP, p.ifname)
 		if err := srv.installIpipEsp(p.clientIP, p.ifname, keys); err != nil {
-			return err
+			return false, err
 		}
-		p.espSpiToServer, p.espSpiToClient = keys.ToServer.Spi, keys.ToClient.Spi
-		p.espPrevSpiToServer, p.espPrevSpiToClient = 0, 0
+		p.setActiveEspGeneration(keys.ToServer.Spi, keys.ToClient.Spi)
+		return true, nil
+	}
+
+	// Replace a stale pending generation: the client never activated or
+	// abandoned it (e.g. its helper died between PREPARE and install), so
+	// its states are dead weight the kernel should not accumulate.
+	srv.dropPendingEspGenLocked(p, "replaced by new prepare")
+
+	toServer, toClient := srv.ipipEspStates(p.clientIP, keys)
+	if err := netlink.XfrmStateAdd(toServer); err != nil {
+		return false, fmt.Errorf("add prepare to-server esp state: %v", err)
+	}
+	// Any failure past this point must unwind the orphan inbound (and the
+	// outbound once it lands): the handler 500s, the client never
+	// receives the keys, and unowned states would linger until a sweep.
+	unwind := func(stage string, cause error) error {
+		srv.deleteIpipEspStateBySpi(p.clientIP, srv.BindAddr, keys.ToServer.Spi)
+		srv.deleteIpipEspStateBySpi(srv.BindAddr, p.clientIP, keys.ToClient.Spi)
+		log.Printf("[%v] esp prepare unwound for %v after %s failure", srv.BindAddr, p.clientIP, stage)
+		return cause
+	}
+	if err := netlink.XfrmStateAdd(toClient); err != nil {
+		return false, unwind("outbound state add", fmt.Errorf("add prepare to-client esp state: %v", err))
+	}
+
+	// Re-assert the inbound policy (upsert; reqid-0 template accepts every
+	// inbound generation). The OUTBOUND policy is deliberately left alone
+	// -- it must keep selecting the active generation -- unless it is
+	// missing entirely (lost somehow on an adopted pair), in which case it
+	// is healed to point at the newest pre-existing outbound generation.
+	polIn, _ := srv.ipipEspPolicies(p.clientIP, 0)
+	if err := netlink.XfrmPolicyUpdate(polIn); err != nil {
+		return false, unwind("inbound policy", fmt.Errorf("re-assert inbound esp policy: %v", err))
+	}
+	_, outFound, err := srv.outboundIpipEspPolicyReqid(p.clientIP)
+	if err != nil {
+		return false, unwind("outbound policy read", err)
+	}
+	if !outFound {
+		healReqid, ok := newestIpipEspToClientReqid(states, srv.BindAddr, p.clientIP, keys.ToClient.Spi)
+		if !ok {
+			// live==true guarantees at least one server->client state.
+			healReqid = 0
+		}
+		_, polOut := srv.ipipEspPolicies(p.clientIP, healReqid)
+		if err := netlink.XfrmPolicyUpdate(polOut); err != nil {
+			return false, unwind("outbound policy heal", fmt.Errorf("heal outbound esp policy: %v", err))
+		}
+		log.Printf("[%v] esp outbound policy healed for %v (reqid 0x%x)",
+			srv.BindAddr, p.clientIP, healReqid)
+	}
+
+	p.espPendingSpiToServer, p.espPendingSpiToClient = keys.ToServer.Spi, keys.ToClient.Spi
+
+	log.Printf("[%v] esp generation prepared for ipip peer %v (%s, spi to-server 0x%x, to-client 0x%x, reqid 0x%x; policy untouched)",
+		srv.BindAddr, p.clientIP, p.ifname,
+		keys.ToServer.Spi, keys.ToClient.Spi, ipipEspReqid(keys.ToClient.Spi))
+
+	go srv.ipipEspPendingReapLoop(p.clientIP, p.espRekeyEpoch,
+		keys.ToServer.Spi, keys.ToClient.Spi)
+	return false, nil
+}
+
+// dropPendingEspGenLocked deletes the peer's pending generation's kernel
+// states (if any) and clears the pending bookkeeping. Caller must hold
+// ipipMu. Never touches active or previous generations.
+func (srv *Server) dropPendingEspGenLocked(p *ipipPeer, why string) {
+	if p.espPendingSpiToServer == 0 && p.espPendingSpiToClient == 0 {
+		return
+	}
+	log.Printf("[%v] esp pending generation dropped for %v (spi to-server 0x%x, to-client 0x%x): %s",
+		srv.BindAddr, p.clientIP, p.espPendingSpiToServer, p.espPendingSpiToClient, why)
+	srv.deleteIpipEspStateBySpi(p.clientIP, srv.BindAddr, p.espPendingSpiToServer)
+	srv.deleteIpipEspStateBySpi(srv.BindAddr, p.clientIP, p.espPendingSpiToClient)
+	p.espPendingSpiToServer, p.espPendingSpiToClient = 0, 0
+}
+
+// deleteIpipEspStateBySpi deletes exactly one ESP state by direction and
+// SPI, tolerating missing state. spi 0 is a no-op.
+func (srv *Server) deleteIpipEspStateBySpi(src, dst netip.Addr, spi uint32) {
+	if spi == 0 {
+		return
+	}
+	st := &netlink.XfrmState{
+		Src:   addrToIp(src),
+		Dst:   addrToIp(dst),
+		Proto: netlink.XFRM_PROTO_ESP,
+		Spi:   int(spi),
+	}
+	if err := netlink.XfrmStateDel(st); err != nil && !xfrmNotFound(err) {
+		log.Printf("[%v] failed to delete esp state %v->%v spi 0x%x: %v",
+			srv.BindAddr, src, dst, spi, err)
+	}
+}
+
+// activateIpipEsp is the ACTIVATE step: flip the outbound policy template
+// to the prepared generation's reqid. The previously emitting state is NOT
+// deleted -- the flip is reversible (abandonIpipEsp) and replay-safe
+// because Linux resumes a retained state's sequence counter. Idempotent by
+// SpiToClient. Caller must hold ipipMu and have re-assigned the epoch.
+func (srv *Server) activateIpipEsp(p *ipipPeer, spiToClient uint32) error {
+	if p.espSpiToClient == spiToClient {
+		log.Printf("[%v] esp activate for %v (spi to-client 0x%x): already active",
+			srv.BindAddr, p.clientIP, spiToClient)
 		return nil
 	}
 
-	// The generation to protect from this rekey's GC: the newest existing
-	// inbound, i.e. what the client's outbound rolls back to if its
-	// health check fails. Chosen from the kernel (AddTime) rather than
-	// in-memory SPIs so restart-adopted pairs are protected too.
-	prevInbound := newestIpipEspInboundSpi(states, p.clientIP, srv.BindAddr, keys.ToServer.Spi)
+	// The generation must exist in the kernel (PREPAREd earlier -- by this
+	// process or by one that restarted since; the kernel is the source of
+	// truth, not the peer struct).
+	if _, err := netlink.XfrmStateGet(&netlink.XfrmState{
+		Src:   addrToIp(srv.BindAddr),
+		Dst:   addrToIp(p.clientIP),
+		Proto: netlink.XFRM_PROTO_ESP,
+		Spi:   int(spiToClient),
+	}); err != nil {
+		if xfrmNotFound(err) {
+			return fmt.Errorf("no prepared to-client state with spi 0x%x", spiToClient)
+		}
+		return fmt.Errorf("look up prepared to-client state 0x%x: %v", spiToClient, err)
+	}
 
-	toServer, _ := srv.ipipEspStates(p.clientIP, keys)
-	if err := netlink.XfrmStateAdd(toServer); err != nil {
-		return fmt.Errorf("add rekey to-server esp state: %v", err)
+	prevReqid, prevFound, err := srv.outboundIpipEspPolicyReqid(p.clientIP)
+	if err != nil {
+		return err
 	}
-	// Re-assert the require-ESP policies (upsert). They are SPI-agnostic,
-	// but an adopted pair whose policies were somehow lost gets healed here.
-	polIn, polOut := srv.ipipEspPolicies(p.clientIP)
-	if err := netlink.XfrmPolicyUpdate(polIn); err != nil {
-		return fmt.Errorf("re-assert inbound esp policy: %v", err)
-	}
+
+	_, polOut := srv.ipipEspPolicies(p.clientIP, ipipEspReqid(spiToClient))
 	if err := netlink.XfrmPolicyUpdate(polOut); err != nil {
-		return fmt.Errorf("re-assert outbound esp policy: %v", err)
+		return fmt.Errorf("flip outbound esp policy to reqid 0x%x: %v", ipipEspReqid(spiToClient), err)
 	}
 
-	p.espPrevSpiToServer, p.espPrevSpiToClient = prevInbound, p.espSpiToClient
-	p.espSpiToServer, p.espSpiToClient = keys.ToServer.Spi, keys.ToClient.Spi
-	pending := keys.ToClient
-	p.espPendingToClient = &pending
+	// Bookkeeping: the activated generation becomes active; what was
+	// active becomes previous (still installed, still decrypting); the
+	// pre-flip policy reqid is kept so an ABANDON can revert the flip.
+	newToServer := uint32(0)
+	if p.espPendingSpiToClient == spiToClient {
+		newToServer = p.espPendingSpiToServer
+	}
+	p.espPrevSpiToServer, p.espPrevSpiToClient = p.espSpiToServer, p.espSpiToClient
+	p.espPrevReqid, p.espPrevReqidValid = prevReqid, prevFound
+	p.espSpiToServer, p.espSpiToClient = newToServer, spiToClient
+	p.espPendingSpiToServer, p.espPendingSpiToClient = 0, 0
 
-	log.Printf("[%v] esp rekey minted for ipip peer %v (%s, new spi to-server 0x%x, to-client 0x%x, prev to-server 0x%x, to-client 0x%x)",
-		srv.BindAddr, p.clientIP, p.ifname,
-		keys.ToServer.Spi, keys.ToClient.Spi,
-		p.espPrevSpiToServer, p.espPrevSpiToClient)
+	log.Printf("[%v] esp generation activated for ipip peer %v (%s): outbound policy now reqid 0x%x (spi to-client 0x%x, to-server 0x%x); previous generation retained",
+		srv.BindAddr, p.clientIP, p.ifname, ipipEspReqid(spiToClient), spiToClient, newToServer)
 
-	go srv.ipipEspSwitchLoop(p.clientIP, p.espRekeyEpoch, keys.ToServer.Spi)
+	// GC of superseded generations is gated on dataplane evidence: the
+	// new inbound must carry packets (the client's post-switch health
+	// check) before anything old is deleted. Without the to-server SPI
+	// (activation after a vprox restart lost the pending bookkeeping)
+	// there is no counter to gate on, so no GC -- the next successful
+	// rotation sweeps instead.
+	if newToServer != 0 {
+		go srv.ipipEspGcGateLoop(p.clientIP, p.espRekeyEpoch, newToServer)
+	} else {
+		log.Printf("[%v] esp activate for %v: to-server SPI unknown (restart mid-protocol?); skipping counter-gated GC, next rotation sweeps",
+			srv.BindAddr, p.clientIP)
+	}
 	return nil
 }
 
-// ipipEspSwitchLoop waits for the client's first packet on the new inbound
-// SA (proof the client transmits on the new generation), then switches the
-// server's outbound to it. On timeout it switches anyway -- the client
-// keeps every inbound generation it knows (including a rolled-back one),
-// so a timeout-switch stays decryptable; only a client that vanished
-// mid-rekey would miss the new generation, and its next connect replaces
-// everything.
-func (srv *Server) ipipEspSwitchLoop(clientIP netip.Addr, epoch uint64, newSpiToServer uint32) {
+// abandonIpipEsp is the ABANDON step, the client's escape hatch when its
+// on-the-wire proof of the new generation failed.
+//
+//   - Abandoning a still-pending generation deletes its two (never
+//     emitting, never proven) states and nothing else.
+//   - Abandoning the ACTIVE generation flips the outbound policy back to
+//     the pre-activation reqid -- replay-safe, since the previous state
+//     was never deleted and its sequence counter kept counting -- and
+//     restores the previous generation as active. The abandoned states
+//     stay installed (the client may have partial state; deleting here
+//     buys nothing) until a later successful rotation's GC sweeps them.
+//   - Anything else is a stale/duplicate abandon and is a no-op.
+//
+// Caller must hold ipipMu and have re-assigned the epoch (which also
+// cancels the abandoned generation's GC gate loop).
+func (srv *Server) abandonIpipEsp(p *ipipPeer, spiToClient uint32) error {
+	if p.espPendingSpiToClient == spiToClient && spiToClient != 0 {
+		srv.dropPendingEspGenLocked(p, "abandoned by client before activation")
+		return nil
+	}
+	if p.espSpiToClient == spiToClient && spiToClient != 0 {
+		if !p.espPrevReqidValid {
+			return fmt.Errorf("no pre-activation policy reqid recorded; cannot revert flip")
+		}
+		_, polOut := srv.ipipEspPolicies(p.clientIP, p.espPrevReqid)
+		if err := netlink.XfrmPolicyUpdate(polOut); err != nil {
+			return fmt.Errorf("revert outbound esp policy to reqid 0x%x: %v", p.espPrevReqid, err)
+		}
+		log.Printf("[%v] esp generation 0x%x abandoned for ipip peer %v (%s): outbound policy reverted to reqid 0x%x; abandoned states left for next rotation's sweep",
+			srv.BindAddr, spiToClient, p.clientIP, p.ifname, p.espPrevReqid)
+		p.espSpiToServer, p.espSpiToClient = p.espPrevSpiToServer, p.espPrevSpiToClient
+		p.espPrevSpiToServer, p.espPrevSpiToClient = 0, 0
+		p.espPrevReqid, p.espPrevReqidValid = 0, false
+		return nil
+	}
+	log.Printf("[%v] esp abandon for %v (spi to-client 0x%x): not pending or active; nothing to do",
+		srv.BindAddr, p.clientIP, spiToClient)
+	return nil
+}
+
+// ipipEspGcGateLoop is the counter gate for old-generation GC after an
+// ACTIVATE: it waits for the first packet on the newly active generation's
+// INBOUND SA -- on-the-wire proof the client completed its own switch --
+// then, after a grace period, sweeps every other state of the pair. On
+// timeout it deletes NOTHING; stragglers wait for the next successful
+// rotation's sweep.
+func (srv *Server) ipipEspGcGateLoop(clientIP netip.Addr, epoch uint64, newSpiToServer uint32) {
 	lookup := &netlink.XfrmState{
 		Src:   addrToIp(clientIP),
 		Dst:   addrToIp(srv.BindAddr),
 		Proto: netlink.XFRM_PROTO_ESP,
 		Spi:   int(newSpiToServer),
 	}
-	deadline := time.Now().Add(ipipEspSwitchTimeout)
-	byCounter := false
+	deadline := time.Now().Add(ipipEspGcGateTimeout)
+	confirmed := false
 	for time.Now().Before(deadline) {
 		select {
 		case <-srv.Ctx.Done():
 			return
-		case <-time.After(ipipEspSwitchPoll):
+		case <-time.After(ipipEspGcGatePoll):
 		}
 		state, err := netlink.XfrmStateGet(lookup)
 		if err != nil {
 			if xfrmNotFound(err) {
-				log.Printf("[%v] esp rekey switch aborted for %v: new inbound state (spi 0x%x) gone",
+				log.Printf("[%v] esp GC gate aborted for %v: new inbound state (spi 0x%x) gone",
 					srv.BindAddr, clientIP, newSpiToServer)
 				return
 			}
-			log.Printf("[%v] esp rekey switch poll failed transiently for %v: %v",
+			log.Printf("[%v] esp GC gate poll failed transiently for %v: %v",
 				srv.BindAddr, clientIP, err)
 			continue
 		}
 		if state.Statistics.Packets > 0 {
-			byCounter = true
+			confirmed = true
 			break
 		}
 	}
-	srv.switchIpipEspOutbound(clientIP, epoch, byCounter)
-}
-
-// switchIpipEspOutbound installs the pending outbound SA and deletes every
-// other server->client state so the kernel deterministically emits the new
-// generation. After a counter-confirmed switch it schedules old-generation
-// GC; after a timeout-switch it does NOT -- the client may have rolled
-// back its outbound to the previous generation (health-check failure), and
-// GC'ing that generation's inbound SA here would cut it off. The next
-// confirmed rekey's GC sweeps all stale generations anyway.
-func (srv *Server) switchIpipEspOutbound(clientIP netip.Addr, epoch uint64, byCounter bool) {
-	srv.ipipMu.Lock()
-	defer srv.ipipMu.Unlock()
-
-	p, ok := srv.ipipPeers[clientIP]
-	if !ok || p.espRekeyEpoch != epoch || p.espPendingToClient == nil {
-		log.Printf("[%v] esp rekey switch superseded for %v; not switching",
-			srv.BindAddr, clientIP)
-		return
-	}
-	sa := *p.espPendingToClient
-
-	toClient := ipipEspXfrmState(srv.BindAddr, clientIP, sa)
-	if err := netlink.XfrmStateAdd(toClient); err != nil {
-		// Old outbound stays in place; the pair keeps flowing on the old
-		// generation and the next rekey retries the whole rotation.
-		log.Printf("[%v] esp rekey switch FAILED for %v: add to-client state (spi 0x%x): %v; keeping old outbound",
-			srv.BindAddr, clientIP, sa.Spi, err)
-		return
-	}
-	p.espPendingToClient = nil
-
-	deleted, err := srv.deleteIpipEspStatesExcept(
-		srv.BindAddr, clientIP, map[uint32]struct{}{sa.Spi: {}})
-	if err != nil {
-		log.Printf("[%v] esp rekey switch: old outbound delete FAILED for %v: %v",
-			srv.BindAddr, clientIP, err)
+	if !confirmed {
+		log.Printf("[%v] esp GC gate timed out for %v (no packets on new inbound spi 0x%x); deleting nothing, next rotation sweeps",
+			srv.BindAddr, clientIP, newSpiToServer)
 		return
 	}
 
-	how := "timeout"
-	if byCounter {
-		how = "counter"
-	}
-	log.Printf("[%v] esp outbound switched for %v (spi to-client 0x%x, by %s, removed %d old outbound state(s))",
-		srv.BindAddr, clientIP, sa.Spi, how, len(deleted))
-
-	if byCounter {
-		go srv.ipipEspGcLoop(clientIP, epoch)
-	} else {
-		log.Printf("[%v] esp rekey switch by timeout for %v: skipping old-generation GC (client may have rolled back); next confirmed rekey will sweep",
-			srv.BindAddr, clientIP)
-	}
-}
-
-// ipipEspGcLoop deletes every ESP state for the pair except the current
-// generation, a grace period after a counter-confirmed switch. List-based
-// deletion also sweeps generations vprox no longer knows about (map lost
-// across a restart).
-func (srv *Server) ipipEspGcLoop(clientIP netip.Addr, epoch uint64) {
 	select {
 	case <-srv.Ctx.Done():
 		return
@@ -415,18 +577,13 @@ func (srv *Server) ipipEspGcLoop(clientIP netip.Addr, epoch uint64) {
 		log.Printf("[%v] esp rekey GC superseded for %v; skipping", srv.BindAddr, clientIP)
 		return
 	}
+	// Epoch match means no request touched the pair since the ACTIVATE
+	// that spawned this loop, so the active generation is still the one
+	// the counter proved. Everything else -- previous generation,
+	// abandoned strays, restart orphans -- is swept (list-based).
 	keep := map[uint32]struct{}{
 		p.espSpiToServer: {},
 		p.espSpiToClient: {},
-	}
-	// Keep the previous inbound generation: a counter-confirmed switch
-	// only proves the client transmitted on the new generation once (its
-	// health check does that even when it fails), not that it stayed
-	// there. If the client rolled back, its outbound is on this
-	// generation, and "vprox keeps accepting both" is the rollback
-	// contract. It is swept by the NEXT confirmed rekey's GC.
-	if p.espPrevSpiToServer != 0 {
-		keep[p.espPrevSpiToServer] = struct{}{}
 	}
 	var deleted []ipipEspStateKey
 	for _, dir := range [][2]netip.Addr{
@@ -441,6 +598,8 @@ func (srv *Server) ipipEspGcLoop(clientIP netip.Addr, epoch uint64) {
 		}
 		deleted = append(deleted, d...)
 	}
+	p.espPrevSpiToServer, p.espPrevSpiToClient = 0, 0
+	p.espPrevReqid, p.espPrevReqidValid = 0, false
 	for _, s := range deleted {
 		log.Printf("[%v] esp rekey GC'd old generation state for %v (spi 0x%x, %v->%v)",
 			srv.BindAddr, clientIP, s.Spi, s.Src, s.Dst)
@@ -448,6 +607,29 @@ func (srv *Server) ipipEspGcLoop(clientIP netip.Addr, epoch uint64) {
 	if len(deleted) == 0 {
 		log.Printf("[%v] esp rekey GC for %v: nothing to sweep", srv.BindAddr, clientIP)
 	}
+}
+
+// ipipEspPendingReapLoop deletes a prepared generation the client never
+// followed up on (helper killed between PREPARE and its local install).
+// Any request that touches the pair meanwhile re-assigns the epoch and
+// disarms this reap; the next PREPARE also drops a stale pending directly.
+// Active and previous generations are never touched here.
+func (srv *Server) ipipEspPendingReapLoop(clientIP netip.Addr, epoch uint64, spiToServer, spiToClient uint32) {
+	select {
+	case <-srv.Ctx.Done():
+		return
+	case <-time.After(ipipEspPendingReap):
+	}
+
+	srv.ipipMu.Lock()
+	defer srv.ipipMu.Unlock()
+
+	p, ok := srv.ipipPeers[clientIP]
+	if !ok || p.espRekeyEpoch != epoch ||
+		p.espPendingSpiToServer != spiToServer || p.espPendingSpiToClient != spiToClient {
+		return
+	}
+	srv.dropPendingEspGenLocked(p, "never activated or abandoned (reap timeout)")
 }
 
 // listIpipEspStateKeys lists all v4 ESP states as pure state keys.
@@ -471,6 +653,7 @@ func (srv *Server) listIpipEspStateKeys() ([]ipipEspStateKey, error) {
 			Src:     src,
 			Dst:     dst,
 			Spi:     uint32(s.Spi),
+			Reqid:   s.Reqid,
 			AddTime: s.Statistics.AddTime,
 		})
 	}
