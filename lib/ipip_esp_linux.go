@@ -83,13 +83,19 @@ func ipipEspReqid(spiToClient uint32) int {
 // Reqid). SPIs are minted across the full uint32 range, so on a 32-bit
 // platform roughly half of them would not fit in int and would silently
 // go negative in netlink structs. vprox only builds for 64-bit Linux;
-// this guard makes that assumption explicit instead of truncating.
+// the compile-time assertion below makes that assumption explicit, and
+// the halves are converted separately so each narrowing is provably
+// within int range on any platform.
 func spiToInt(spi uint32) int {
-	if uint64(spi) > uint64(math.MaxInt) {
-		panic(fmt.Sprintf("ESP SPI 0x%x exceeds int range: 32-bit builds are unsupported", spi))
-	}
-	return int(spi)
+	hi := int(spi >> 16)    // <= 0xffff, always fits in int
+	lo := int(spi & 0xffff) // <= 0xffff, always fits in int
+	return hi<<16 | lo
 }
+
+// vprox requires a 64-bit int: netlink's Spi/Reqid fields are int and
+// SPIs use the full uint32 range. This fails the build on 32-bit targets
+// instead of letting high-bit SPIs go negative at runtime.
+const _ = uint64(math.MaxInt) - uint64(math.MaxUint32)
 
 // ipipEspXfrmState builds one transport-mode ESP xfrm state.
 func ipipEspXfrmState(src, dst netip.Addr, sa ipipEspSA, reqid int) *netlink.XfrmState {
