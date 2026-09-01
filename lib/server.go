@@ -93,7 +93,7 @@ type Server struct {
 
 	ipAllocator *IpAllocator
 
-	mu sync.Mutex // Protects the fields below.
+	mu sync.Mutex // Protects newPeers and peerIPs.
 	// newPeers records the time of each peer's most recent /connect, granting
 	// a grace period during which the idle reaper won't remove the peer. This
 	// protects peers that haven't completed a WireGuard handshake yet, and
@@ -109,6 +109,21 @@ type Server struct {
 	peerIPs map[wgtypes.Key]netip.Addr
 
 	readiness *serverReadiness
+
+	// ipipMu protects ipipPeers, ipipClosed, and the kernel IPIP objects
+	// for those peers (interface, /32 host route, per-peer FORWARD
+	// filter). Hold it through LinkAdd/LinkDel so the map cannot claim
+	// "no tunnel" while the kernel still owns that (local, remote)
+	// pair. It is separate from mu so IPIP bookkeeping does not contend
+	// with WireGuard peer state. Do not hold it across HTTP writes.
+	ipipMu     sync.Mutex
+	ipipPeers  map[netip.Addr]*ipipPeer
+	ipipClosed bool // set by CleanupIpip; serveIpip refuses new tunnels
+
+	// ipipSweepHealth tracks the housekeeping sweep's pass/error counters
+	// and last success for the log-based sweep health lines (vprox has no
+	// prometheus).
+	ipipSweepHealth ipipSweepHealth
 }
 
 // InitState initializes the private server state.
@@ -134,9 +149,26 @@ func (srv *Server) InitState() error {
 	if reservedIp != srv.WgCidr.Addr() {
 		return fmt.Errorf("reserved IP address mistamches CIDR: %v != %v", reservedIp, srv.WgCidr.Addr())
 	}
+
+	// Fail fast if WgCidr is wide enough that a peer's IPIP interface name
+	// would exceed IFNAMSIZ; otherwise every /connect-ipip request would
+	// 500 at runtime instead. The longest name comes from the last address
+	// of the block.
+	maskedWg := srv.WgCidr.Masked()
+	wgBase := maskedWg.Addr().As4()
+	lastInt := (uint32(wgBase[0])<<24 | uint32(wgBase[1])<<16 |
+		uint32(wgBase[2])<<8 | uint32(wgBase[3])) | (^uint32(0) >> uint(maskedWg.Bits()))
+	lastAddr := netip.AddrFrom4([4]byte{
+		byte(lastInt >> 24), byte(lastInt >> 16), byte(lastInt >> 8), byte(lastInt),
+	})
+	if _, err := srv.ipipIfname(lastAddr); err != nil {
+		return fmt.Errorf("WgCidr %v too wide for IPIP: %v", srv.WgCidr, err)
+	}
+
 	srv.newPeers = make(map[wgtypes.Key]time.Time)
 	srv.peerIPs = make(map[wgtypes.Key]netip.Addr)
 	srv.initReadiness()
+	srv.ipipPeers = make(map[netip.Addr]*ipipPeer)
 	return nil
 }
 
@@ -700,6 +732,16 @@ func (srv *Server) StartIptables() error {
 		return err
 	}
 
+	// Wildcard TCP MSS clamping for this server's IPIP interfaces. The
+	// interfaces themselves are created lazily by /connect-ipip or restored
+	// from leftover kernel tunnels at startup; the FORWARD ACCEPT/DROP
+	// filter is installed per peer at that point so each tunnel only
+	// accepts traffic with the inner source IP we assigned to it (see
+	// addIpipPeerFilter).
+	if err := srv.iptablesIpipMssRules(true); err != nil {
+		return fmt.Errorf("failed to add ipip MSS rules: %v", err)
+	}
+
 	// Shutdown intentionally leaves iptables rules in place (see
 	// ServerManager.Start), so an internal SNAT rule can outlive the bind
 	// address it targeted. Remove stale rules before installing the current
@@ -717,6 +759,9 @@ func (srv *Server) CleanupIptables() {
 		if err := srv.Ipt.Delete(rule.table, rule.chain, rule.spec...); err != nil {
 			log.Printf("failed to remove %s: %v", rule.description, err)
 		}
+	}
+	if err := srv.iptablesIpipMssRules(false); err != nil {
+		log.Printf("failed to remove ipip MSS rules: %v", err)
 	}
 }
 
@@ -838,12 +883,37 @@ func (srv *Server) addBindAddr() error {
 	})
 }
 
+// requireExternalRemote rejects requests whose source IP is inside
+// srv.WgCidr -- i.e. requests that arrived from inside a VPN tunnel rather
+// than from the public network. The control plane is meant to be reached
+// from clients' outer addresses only; both connectHandler and
+// connectIpipHandler treat r.RemoteAddr as identity-relevant input (for
+// logging and for the IPIP peer-map key respectively), so a request whose
+// apparent source is a VPN-internal IP is either spoofed or a
+// misconfigured client routing everything into the tunnel. Either way it
+// is not legitimate, and rejecting it here keeps the assumption that
+// "RemoteAddr is the client's real outer address" honest for every
+// control-plane handler without each having to recheck.
+func (srv *Server) requireExternalRemote(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err == nil {
+			if ip, err := netip.ParseAddr(host); err == nil && srv.WgCidr.Contains(ip) {
+				http.Error(w, "control-plane requests must originate outside the VPN", http.StatusForbidden)
+				return
+			}
+		}
+		h(w, r)
+	}
+}
+
 func (srv *Server) ListenForHttps() error {
 	if !srv.BindAddr.Is4() {
 		return fmt.Errorf("invalid IPv4 bind address: %v", srv.BindAddr)
 	}
 
 	go srv.removeIdlePeersLoop()
+	go srv.ipipHousekeepingLoop()
 
 	// Some bind addresses may not have been added to the network interface. If
 	// that is the case, we need to add it (transiently).
@@ -852,7 +922,8 @@ func (srv *Server) ListenForHttps() error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.indexHandler)
-	mux.HandleFunc("/connect", srv.connectHandler)
+	mux.HandleFunc("/connect", srv.requireExternalRemote(srv.connectHandler))
+	mux.HandleFunc("/connect-ipip", srv.requireExternalRemote(srv.connectIpipHandler))
 
 	cert, err := loadServerTls()
 	if err != nil {
@@ -888,7 +959,15 @@ func (srv *Server) ListenForHttps() error {
 	select {
 	case <-srv.Ctx.Done():
 		log.Printf("server no longer listening on %v:443\n", srv.BindAddr)
-		return httpServer.Shutdown(srv.Ctx)
+		// srv.Ctx is already cancelled here, so passing it to Shutdown
+		// would return immediately without draining in-flight handlers.
+		// Drain with a fresh deadline so in-flight handlers (notably
+		// /connect-ipip) finish. Kernel IPIP tunnels are left in place
+		// across shutdown, like WireGuard, so a cached Mac gif keeps
+		// working across deploys.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return httpServer.Shutdown(shutdownCtx)
 	case err = <-errCh:
 		return err
 	}

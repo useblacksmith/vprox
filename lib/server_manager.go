@@ -132,13 +132,16 @@ func (sm *ServerManager) Start(ip netip.Addr) error {
 		defer sm.freeIndex(i)
 		defer cancel()
 
-		// Note: we intentionally do NOT clean up the WireGuard interface or
-		// iptables rules on shutdown. The kernel dataplane keeps forwarding
-		// for existing peers while the process is down, which makes restarts
-		// (i.e. deploys) hitless. On startup, StartWireguard adopts the
-		// surviving interface and RestorePeersFromKernel rebuilds the
-		// in-memory peer state from it. CleanupWireguard/CleanupIptables
-		// remain available for manual decommissioning.
+		// Note: we intentionally do NOT clean up the WireGuard interface,
+		// IPIP tunnels, or iptables rules on shutdown. The kernel dataplane
+		// keeps forwarding for existing peers while the process is down,
+		// which makes restarts (i.e. deploys) hitless. On startup,
+		// StartWireguard adopts the surviving interface,
+		// RestorePeersFromKernel rebuilds in-memory WireGuard peer state,
+		// and RestoreIpipFromKernel adopts leftover IPIP tunnels (Mac
+		// clients cache gif with no keepalive). CleanupWireguard,
+		// CleanupIptables, and CleanupIpip remain available for manual
+		// decommissioning.
 		if err := srv.StartWireguard(); err != nil {
 			srv.markReadinessFatal(ReadinessReasonWireGuardUnavailable)
 			log.Printf("[%v] failed to start WireGuard: %v", ip, err)
@@ -154,6 +157,11 @@ func (sm *ServerManager) Start(ip netip.Addr) error {
 		if err := srv.StartIptables(); err != nil {
 			srv.markReadinessFatal(ReadinessReasonIptablesRuleMissing)
 			log.Printf("[%v] failed to start iptables: %v", ip, err)
+			return
+		}
+		if err := srv.RestoreIpipFromKernel(); err != nil {
+			srv.markReadinessFatal(ReadinessReasonServerSetupFailed)
+			log.Printf("[%v] failed to restore ipip tunnels from kernel: %v", ip, err)
 			return
 		}
 
