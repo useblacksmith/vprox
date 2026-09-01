@@ -864,6 +864,11 @@ func (srv *Server) ListenForHttps() error {
 		TLSConfig: &tls.Config{
 			Certificates: []tls.Certificate{cert},
 		},
+		// Bound header/body reads and idle keep-alives so slow clients
+		// cannot hold connections open and exhaust file descriptors.
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       2 * time.Minute,
 	}
 
 	listener, err := net.Listen("tcp", fmt.Sprintf("%v:443", srv.BindAddr))
