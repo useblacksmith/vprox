@@ -1,6 +1,6 @@
 module github.com/modal-labs/vprox
 
-go 1.22.5
+go 1.26.0
 
 require (
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.16.12
