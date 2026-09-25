@@ -981,6 +981,12 @@ func (srv *Server) ListenForHttps() error {
 //go:embed certs/cert.pem certs/key.pem
 var defaultCerts embed.FS
 
+// LoadServerTLS loads the embedded TLS certificate shared by the control
+// server and the egress relay.
+func LoadServerTLS() (tls.Certificate, error) {
+	return loadServerTls()
+}
+
 // loadServerTls loads the server's TLS certificate for control connections.
 func loadServerTls() (tls.Certificate, error) {
 	certData, _ := defaultCerts.ReadFile("certs/cert.pem")
