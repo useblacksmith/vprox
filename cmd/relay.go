@@ -33,7 +33,7 @@ IP the session was granted, after checking it against the destination policy.`,
 }
 
 var relayCmdArgs struct {
-	listen        []string
+	listen        string
 	allowSources  []string
 	denyCIDRs     []string
 	denyPorts     []uint
@@ -55,8 +55,8 @@ var relayCmdArgs struct {
 func init() {
 	f := RelayCmd.Flags()
 	def := relay.DefaultLimits()
-	f.StringArrayVar(&relayCmdArgs.listen, "listen", []string{"0.0.0.0:9443"},
-		"address to accept relay sessions on (repeatable)")
+	f.StringVar(&relayCmdArgs.listen, "listen", "0.0.0.0:9443",
+		"address to accept relay sessions on")
 	f.StringArrayVar(&relayCmdArgs.allowSources, "allow-source", nil,
 		"source CIDR allowed to open sessions (repeatable, required)")
 	f.StringArrayVar(&relayCmdArgs.denyCIDRs, "deny-cidr", nil,
@@ -172,23 +172,12 @@ func runRelay(cmd *cobra.Command, args []string) error {
 
 	log.Printf("relay: allow sources %v; deny %s", allow, policy)
 
-	errCh := make(chan error, len(relayCmdArgs.listen))
-	for _, addr := range relayCmdArgs.listen {
-		ln, err := net.Listen("tcp", addr)
-		if err != nil {
-			stop()
-			return fmt.Errorf("listen %s: %v", addr, err)
-		}
-		log.Printf("relay: listening on %s", ln.Addr())
-		go func() { errCh <- srv.Serve(ctx, ln) }()
+	ln, err := net.Listen("tcp", relayCmdArgs.listen)
+	if err != nil {
+		return fmt.Errorf("listen %s: %v", relayCmdArgs.listen, err)
 	}
-	for range relayCmdArgs.listen {
-		if err := <-errCh; err != nil {
-			stop()
-			return err
-		}
-	}
-	return nil
+	log.Printf("relay: listening on %s", ln.Addr())
+	return srv.Serve(ctx, ln)
 }
 
 func parsePrefixes(strs []string) ([]netip.Prefix, error) {

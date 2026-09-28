@@ -83,7 +83,6 @@ type Server struct {
 	sessions  map[*session]struct{}
 	perSource map[netip.Addr]int
 	draining  bool
-	ln        net.Listener
 
 	wg      sync.WaitGroup
 	bufPool sync.Pool
@@ -164,12 +163,9 @@ func NewServer(cfg Config) (*Server, error) {
 // Serve accepts on ln until ctx is cancelled, then drains: the listener
 // closes, every session receives a yamux GoAway so the host proxy
 // reconnects to the next relay process, and open streams get up to
-// Limits.DrainTimeout to finish before they are cut.
+// Limits.DrainTimeout to finish before they are cut. A Server serves one
+// listener; Serve must not be called concurrently.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
-	s.mu.Lock()
-	s.ln = ln
-	s.mu.Unlock()
-
 	acceptErr := make(chan error, 1)
 	go func() {
 		acceptErr <- s.acceptLoop(ln)
@@ -308,8 +304,8 @@ func (s *Server) handleConn(raw net.Conn, src netip.Addr) {
 		vmID:     hello.VMID,
 		staticIP: staticIP,
 	}
-	if !s.admitSession(sess) {
-		s.refuseHello(tc, src, relayproto.HelloSessionLimit, "session limit")
+	if status, msg := s.admitSession(sess); status != relayproto.HelloOK {
+		s.refuseHello(tc, src, status, msg)
 		return
 	}
 	defer s.releaseSession(sess)
@@ -327,7 +323,7 @@ func (s *Server) handleConn(raw net.Conn, src netip.Addr) {
 		s.cfg.Logf("relay: %s vm=%s: yamux: %v", src, hello.VMID, err)
 		return
 	}
-	sess.mux = ys
+	sess.setMux(ys)
 	s.cfg.Metrics.SessionsTotal.Inc()
 	s.cfg.Logf("relay: session open src=%s vm=%s egress=%s", src, hello.VMID, staticIP)
 	sess.serve()
@@ -341,22 +337,24 @@ func (s *Server) refuseHello(tc *tls.Conn, src netip.Addr, status byte, msg stri
 	_ = relayproto.WriteHelloReply(tc, status, relayproto.HelloReplyBody{Error: msg})
 }
 
-func (s *Server) admitSession(sess *session) bool {
+// admitSession registers sess and returns HelloOK, or the hello status and
+// message to refuse it with.
+func (s *Server) admitSession(sess *session) (byte, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.draining {
-		return false
+		return relayproto.HelloUnavailable, "relay is draining"
 	}
 	if len(s.sessions) >= s.cfg.Limits.MaxSessions {
-		return false
+		return relayproto.HelloSessionLimit, "session limit"
 	}
 	if s.perSource[sess.src] >= s.cfg.Limits.MaxSessionsPerSource {
-		return false
+		return relayproto.HelloSessionLimit, "per-source session limit"
 	}
 	s.sessions[sess] = struct{}{}
 	s.perSource[sess.src]++
 	s.cfg.Metrics.SessionsOpen.Set(float64(len(s.sessions)))
-	return true
+	return relayproto.HelloOK, ""
 }
 
 func (s *Server) releaseSession(sess *session) {
@@ -385,7 +383,13 @@ type session struct {
 	src      netip.Addr
 	vmID     string
 	staticIP netip.Addr
-	mux      *yamux.Session
+
+	// The session is registered (and thus reachable by drain) before the
+	// hello reply is written and the mux exists, so a GoAway requested in
+	// that window is recorded and sent as soon as the mux is set.
+	muxMu     sync.Mutex
+	mux       *yamux.Session
+	goAwaySet bool
 
 	streamsOpen  atomic.Int64
 	udpOpen      atomic.Int64
@@ -396,15 +400,32 @@ type session struct {
 	streamWG sync.WaitGroup
 }
 
+func (sess *session) setMux(ys *yamux.Session) {
+	sess.muxMu.Lock()
+	sess.mux = ys
+	pending := sess.goAwaySet
+	sess.muxMu.Unlock()
+	if pending {
+		_ = ys.GoAway()
+	}
+}
+
 func (sess *session) goAway() {
-	if sess.mux != nil {
-		_ = sess.mux.GoAway()
+	sess.muxMu.Lock()
+	sess.goAwaySet = true
+	mux := sess.mux
+	sess.muxMu.Unlock()
+	if mux != nil {
+		_ = mux.GoAway()
 	}
 }
 
 func (sess *session) close() {
-	if sess.mux != nil {
-		_ = sess.mux.Close()
+	sess.muxMu.Lock()
+	mux := sess.mux
+	sess.muxMu.Unlock()
+	if mux != nil {
+		_ = mux.Close()
 	}
 }
 
