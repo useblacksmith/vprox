@@ -15,7 +15,6 @@ import (
 	"net/netip"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/hashicorp/yamux"
@@ -502,7 +501,6 @@ func (sess *session) relayTCP(st *yamux.Stream, dst netip.AddrPort) {
 	d := net.Dialer{
 		Timeout:   srv.cfg.Limits.DialTimeout,
 		LocalAddr: &net.TCPAddr{IP: sess.staticIP.AsSlice()},
-		Control:   setSockBufs,
 	}
 	t0 := time.Now()
 	c, err := d.Dial("tcp4", dst.String())
@@ -663,16 +661,4 @@ func (g *idleGuard) check() {
 
 func (g *idleGuard) stop() {
 	g.timer.Stop()
-}
-
-// destSockBuf is the destination socket buffer size. It is set before
-// connect so the TCP window scale is negotiated against the enlarged
-// buffer.
-const destSockBuf = 4 * 1024 * 1024
-
-func setSockBufs(network, address string, c syscall.RawConn) error {
-	return c.Control(func(fd uintptr) {
-		_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, destSockBuf)
-		_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, destSockBuf)
-	})
 }
