@@ -12,7 +12,7 @@
 //
 //	per yamux stream
 //	  client -> server  StreamHeader: u8 proto (6=TCP, 17=UDP) | 4 bytes dst IPv4 | u16 dst port
-//	  server -> client  StreamReply:  u8 status | u32 dial micros
+//	  server -> client  StreamReply:  u8 status
 //	  TCP: raw bytes both ways, half-close propagated
 //	  UDP: datagrams framed as u16 length | payload, both ways
 package relayproto
@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
-	"time"
 )
 
 // Version is the protocol version carried in the hello.
@@ -42,7 +41,7 @@ const (
 	MaxHelloBody = 4096
 
 	StreamHeaderLen = 7
-	StreamReplyLen  = 5
+	StreamReplyLen  = 1
 
 	// MaxDatagram is the largest UDP payload carried in one frame.
 	MaxDatagram = 65535
@@ -274,29 +273,18 @@ func ReadStreamHeader(r io.Reader) (StreamHeader, error) {
 	return StreamHeader{Proto: b[0], Dst: netip.AddrPortFrom(addr, binary.BigEndian.Uint16(b[5:7]))}, nil
 }
 
-// EncodeStreamReply encodes the relay's per-stream answer. The dial time is
-// saturated to fit 32 bits of microseconds.
-func EncodeStreamReply(status byte, dial time.Duration) []byte {
-	out := make([]byte, StreamReplyLen)
-	out[0] = status
-	us := dial.Microseconds()
-	if us < 0 {
-		us = 0
-	}
-	if us > int64(^uint32(0)) {
-		us = int64(^uint32(0))
-	}
-	binary.BigEndian.PutUint32(out[1:], uint32(us))
-	return out
+// EncodeStreamReply encodes the relay's per-stream answer.
+func EncodeStreamReply(status byte) []byte {
+	return []byte{status}
 }
 
 // ReadStreamReply reads the relay's per-stream answer.
-func ReadStreamReply(r io.Reader) (status byte, dial time.Duration, err error) {
+func ReadStreamReply(r io.Reader) (status byte, err error) {
 	var b [StreamReplyLen]byte
 	if _, err := io.ReadFull(r, b[:]); err != nil {
-		return 0, 0, err
+		return 0, err
 	}
-	return b[0], time.Duration(binary.BigEndian.Uint32(b[1:])) * time.Microsecond, nil
+	return b[0], nil
 }
 
 // WriteDatagram writes one length-prefixed UDP payload.

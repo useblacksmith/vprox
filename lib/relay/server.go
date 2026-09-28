@@ -466,7 +466,24 @@ func (sess *session) handleStream(st *yamux.Stream) {
 func (sess *session) refuseStream(st *yamux.Stream, status byte) {
 	sess.srv.cfg.Metrics.StreamRefused.WithLabelValues(relayproto.StreamStatusString(status)).Inc()
 	_ = st.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	_, _ = st.Write(relayproto.EncodeStreamReply(status, 0))
+	_, _ = st.Write(relayproto.EncodeStreamReply(status))
+}
+
+// dialed records a successful destination dial and sends StreamOK. It
+// returns false if the reply could not be written; the caller then gives
+// up on the stream.
+func (sess *session) dialed(st *yamux.Stream, proto string, dial time.Duration) bool {
+	m := sess.srv.cfg.Metrics
+	m.DialSeconds.WithLabelValues(proto).Observe(dial.Seconds())
+	m.StreamsTotal.WithLabelValues(proto).Inc()
+	sess.streamsTotal.Add(1)
+
+	_ = st.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if _, err := st.Write(relayproto.EncodeStreamReply(relayproto.StreamOK)); err != nil {
+		return false
+	}
+	_ = st.SetWriteDeadline(time.Time{})
+	return true
 }
 
 func (sess *session) relayTCP(st *yamux.Stream, dst netip.AddrPort) {
@@ -477,7 +494,7 @@ func (sess *session) relayTCP(st *yamux.Stream, dst netip.AddrPort) {
 	d := net.Dialer{
 		Timeout:   srv.cfg.Limits.DialTimeout,
 		LocalAddr: &net.TCPAddr{IP: sess.staticIP.AsSlice()},
-		Control:   setSockBufs(4 * 1024 * 1024),
+		Control:   setSockBufs,
 	}
 	t0 := time.Now()
 	c, err := d.Dial("tcp4", dst.String())
@@ -490,17 +507,11 @@ func (sess *session) relayTCP(st *yamux.Stream, dst netip.AddrPort) {
 	defer c.Close()
 	tc := c.(*net.TCPConn)
 	_ = tc.SetNoDelay(true)
-	m.DialSeconds.WithLabelValues("tcp").Observe(dial.Seconds())
-	m.StreamsTotal.WithLabelValues("tcp").Inc()
 	m.StreamsOpen.WithLabelValues("tcp").Inc()
 	defer m.StreamsOpen.WithLabelValues("tcp").Dec()
-	sess.streamsTotal.Add(1)
-
-	_ = st.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	if _, err := st.Write(relayproto.EncodeStreamReply(relayproto.StreamOK, dial)); err != nil {
+	if !sess.dialed(st, "tcp", dial) {
 		return
 	}
-	_ = st.SetWriteDeadline(time.Time{})
 
 	idle := newIdleGuard(srv.cfg.Limits.TCPIdle, func() {
 		_ = tc.Close()
@@ -562,17 +573,11 @@ func (sess *session) relayUDP(st *yamux.Stream, dst netip.AddrPort) {
 		return
 	}
 	defer uc.Close()
-	m.DialSeconds.WithLabelValues("udp").Observe(dial.Seconds())
-	m.StreamsTotal.WithLabelValues("udp").Inc()
 	m.StreamsOpen.WithLabelValues("udp").Inc()
 	defer m.StreamsOpen.WithLabelValues("udp").Dec()
-	sess.streamsTotal.Add(1)
-
-	_ = st.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	if _, err := st.Write(relayproto.EncodeStreamReply(relayproto.StreamOK, dial)); err != nil {
+	if !sess.dialed(st, "udp", dial) {
 		return
 	}
-	_ = st.SetWriteDeadline(time.Time{})
 
 	idle := newIdleGuard(srv.cfg.Limits.UDPIdle, func() {
 		_ = uc.Close()
@@ -652,16 +657,14 @@ func (g *idleGuard) stop() {
 	g.timer.Stop()
 }
 
-// setSockBufs sizes socket buffers before connect so the TCP window scale
-// is negotiated against the enlarged buffer.
-func setSockBufs(n int) func(network, address string, c syscall.RawConn) error {
-	if n <= 0 {
-		return nil
-	}
-	return func(network, address string, c syscall.RawConn) error {
-		return c.Control(func(fd uintptr) {
-			_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, n)
-			_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, n)
-		})
-	}
+// destSockBuf is the destination socket buffer size. It is set before
+// connect so the TCP window scale is negotiated against the enlarged
+// buffer.
+const destSockBuf = 4 * 1024 * 1024
+
+func setSockBufs(network, address string, c syscall.RawConn) error {
+	return c.Control(func(fd uintptr) {
+		_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, destSockBuf)
+		_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, destSockBuf)
+	})
 }

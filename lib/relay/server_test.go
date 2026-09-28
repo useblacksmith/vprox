@@ -148,7 +148,7 @@ func openStream(t *testing.T, sess *yamux.Session, proto byte, dst netip.AddrPor
 	if _, err := st.Write(hdr); err != nil {
 		t.Fatal(err)
 	}
-	status, _, err := relayproto.ReadStreamReply(st)
+	status, err := relayproto.ReadStreamReply(st)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/netip"
 	"testing"
-	"time"
 )
 
 // Wire fixtures shared verbatim with the FastActions/fa copy of this
@@ -17,8 +16,8 @@ const (
 	fixtureHelloRefuse = "01001a7b226572726f72223a226261642063726564656e7469616c227d"
 	fixtureTCPHeader   = "06010101010050"
 	fixtureUDPHeader   = "1101000001007b"
-	fixtureReplyOK     = "00000f4240"
-	fixtureReplyDenied = "0200000000"
+	fixtureReplyOK     = "00"
+	fixtureReplyDenied = "02"
 	fixtureDatagram    = "0003616263"
 )
 
@@ -129,20 +128,15 @@ func TestStreamHeaderFixtures(t *testing.T) {
 }
 
 func TestStreamReplyFixtures(t *testing.T) {
-	if got := EncodeStreamReply(StreamOK, time.Second); !bytes.Equal(got, mustHex(t, fixtureReplyOK)) {
+	if got := EncodeStreamReply(StreamOK); !bytes.Equal(got, mustHex(t, fixtureReplyOK)) {
 		t.Fatalf("reply drifted: %x", got)
 	}
-	if got := EncodeStreamReply(StreamPolicyDenied, 0); !bytes.Equal(got, mustHex(t, fixtureReplyDenied)) {
+	if got := EncodeStreamReply(StreamPolicyDenied); !bytes.Equal(got, mustHex(t, fixtureReplyDenied)) {
 		t.Fatalf("reply drifted: %x", got)
 	}
-	st, d, err := ReadStreamReply(bytes.NewReader(mustHex(t, fixtureReplyOK)))
-	if err != nil || st != StreamOK || d != time.Second {
-		t.Fatalf("got %d %s %v", st, d, err)
-	}
-	// Saturation: a dial longer than 2^32 us still encodes.
-	got := EncodeStreamReply(StreamOK, 2*time.Hour)
-	if _, d, _ := ReadStreamReply(bytes.NewReader(got)); d != time.Duration(^uint32(0))*time.Microsecond {
-		t.Fatalf("saturation: %s", d)
+	st, err := ReadStreamReply(bytes.NewReader(mustHex(t, fixtureReplyOK)))
+	if err != nil || st != StreamOK {
+		t.Fatalf("got %d %v", st, err)
 	}
 }
 
