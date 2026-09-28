@@ -58,7 +58,7 @@ func TestChannelBindingMatchesAcrossTLS13(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer ln.Close()
+		defer func() { _ = ln.Close() }()
 		done := make(chan []byte, 1)
 		go func() {
 			raw, err := ln.Accept()
@@ -78,7 +78,7 @@ func TestChannelBindingMatchesAcrossTLS13(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer tc.Close()
+		defer func() { _ = tc.Close() }()
 		client, err = ChannelBinding(tc.ConnectionState())
 		if err != nil {
 			t.Fatal(err)
