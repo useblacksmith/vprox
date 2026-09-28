@@ -25,7 +25,11 @@ VPROX_PASSWORD=... vprox relay \
 * `--allow-source` is required; connections from other sources are dropped
   before the TLS handshake. Use the same CIDRs as the `/connect-ipip` UFW rule.
 * The TLS certificate defaults to the embedded vprox certificate. The host
-  proxy pins its SPKI; print the pin with `vprox relay --print-spki-pin`.
+  proxy does not verify it against a CA; instead both ends prove knowledge of
+  `VPROX_PASSWORD` over the TLS channel (HMAC-SHA256 of the TLS exporter
+  value `EXPORTER-blacksmith-relay`, client and server roles). The password
+  never crosses the wire and a proof cannot be replayed on another
+  connection; a relay without the password is refused by the host proxy.
 * SIGTERM drains: the listener closes, every session gets a yamux GoAway so
   the host proxy reconnects, and open streams get `--drain-timeout` to finish.
 

@@ -8,6 +8,7 @@
 //	TLS 1.3 connection
 //	  client -> server  Hello:      "BRLY" | u8 version=1 | u16 len | JSON HelloBody
 //	  server -> client  HelloReply: u8 status | u16 len | JSON HelloReplyBody
+//	  (Hello.Auth and HelloReply.Proof authenticate both ends; see auth.go)
 //	  then the connection carries a yamux session (client side opens streams)
 //
 //	per yamux stream
@@ -110,7 +111,8 @@ func StreamStatusString(s byte) string {
 
 // HelloBody is the JSON payload of the client hello.
 type HelloBody struct {
-	// Auth is the bearer credential (phase 1: VPROX_PASSWORD).
+	// Auth is the client's channel-bound proof of the shared password
+	// (ClientProof).
 	Auth string `json:"auth"`
 	// VMID identifies the VM the session belongs to; logged, never trusted
 	// for authorization.
@@ -123,7 +125,10 @@ type HelloBody struct {
 // HelloReplyBody is the JSON payload of the server's hello reply.
 type HelloReplyBody struct {
 	EgressIP string `json:"egress_ip,omitempty"`
-	Error    string `json:"error,omitempty"`
+	// Proof is the relay's channel-bound proof of the shared password
+	// (ServerProof); present only on HelloOK.
+	Proof string `json:"proof,omitempty"`
+	Error string `json:"error,omitempty"`
 }
 
 // StreamHeader identifies the destination of one stream.

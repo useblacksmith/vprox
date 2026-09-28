@@ -96,7 +96,30 @@ func startRelay(t *testing.T, mutate func(*Config)) *testRelay {
 	return r
 }
 
-func dialHello(t *testing.T, addr string, body relayproto.HelloBody) (*tls.Conn, byte, relayproto.HelloReplyBody) {
+// dialHello performs the TLS handshake and hello with the client proof
+// derived from password over this connection's channel binding. When
+// replayAuth is non-empty it is sent verbatim instead, which is how a proof
+// captured on another connection would look to the relay.
+func dialHello(t *testing.T, addr, password string, body relayproto.HelloBody) (*tls.Conn, byte, relayproto.HelloReplyBody) {
+	t.Helper()
+	tc, binding := dialTLS(t, addr)
+	if body.Auth == "" {
+		body.Auth = relayproto.ClientProof(password, binding)
+	}
+	if err := relayproto.WriteHello(tc, body); err != nil {
+		t.Fatal(err)
+	}
+	st, reply, err := relayproto.ReadHelloReply(tc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st == relayproto.HelloOK && !relayproto.VerifyProof(reply.Proof, relayproto.ServerProof(password, binding)) {
+		t.Fatalf("relay server proof does not verify: %q", reply.Proof)
+	}
+	return tc, st, reply
+}
+
+func dialTLS(t *testing.T, addr string) (*tls.Conn, []byte) {
 	t.Helper()
 	raw, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -106,19 +129,16 @@ func dialHello(t *testing.T, addr string, body relayproto.HelloBody) (*tls.Conn,
 	if err := tc.Handshake(); err != nil {
 		t.Fatal(err)
 	}
-	if err := relayproto.WriteHello(tc, body); err != nil {
-		t.Fatal(err)
-	}
-	st, reply, err := relayproto.ReadHelloReply(tc)
+	binding, err := relayproto.ChannelBinding(tc.ConnectionState())
 	if err != nil {
 		t.Fatal(err)
 	}
-	return tc, st, reply
+	return tc, binding
 }
 
 func openSession(t *testing.T, addr string) *yamux.Session {
 	t.Helper()
-	tc, st, reply := dialHello(t, addr, relayproto.HelloBody{Auth: "pw", VMID: "vm1", StaticIP: "127.0.0.1"})
+	tc, st, reply := dialHello(t, addr, "pw", relayproto.HelloBody{VMID: "vm1", StaticIP: "127.0.0.1"})
 	if st != relayproto.HelloOK {
 		t.Fatalf("hello: %d %+v", st, reply)
 	}
@@ -201,15 +221,25 @@ func TestHelloRefusals(t *testing.T) {
 	t.Parallel()
 	r := startRelay(t, nil)
 
-	_, st, _ := dialHello(t, r.addr, relayproto.HelloBody{Auth: "wrong", StaticIP: "127.0.0.1"})
+	_, st, _ := dialHello(t, r.addr, "wrong", relayproto.HelloBody{StaticIP: "127.0.0.1"})
 	if st != relayproto.HelloUnauthorized {
 		t.Fatalf("bad password: status %d", st)
 	}
-	_, st, _ = dialHello(t, r.addr, relayproto.HelloBody{Auth: "pw", StaticIP: "10.9.9.9"})
+	// A valid proof captured on one connection is worthless on another.
+	_, otherBinding := dialTLS(t, r.addr)
+	_, st, _ = dialHello(t, r.addr, "pw", relayproto.HelloBody{Auth: relayproto.ClientProof("pw", otherBinding), StaticIP: "127.0.0.1"})
+	if st != relayproto.HelloUnauthorized {
+		t.Fatalf("replayed proof: status %d", st)
+	}
+	_, st, _ = dialHello(t, r.addr, "pw", relayproto.HelloBody{Auth: "pw", StaticIP: "127.0.0.1"})
+	if st != relayproto.HelloUnauthorized {
+		t.Fatalf("raw password as auth: status %d", st)
+	}
+	_, st, _ = dialHello(t, r.addr, "pw", relayproto.HelloBody{StaticIP: "10.9.9.9"})
 	if st != relayproto.HelloBadStaticIP {
 		t.Fatalf("foreign static ip: status %d", st)
 	}
-	_, st, _ = dialHello(t, r.addr, relayproto.HelloBody{Auth: "pw", StaticIP: "not-an-ip"})
+	_, st, _ = dialHello(t, r.addr, "pw", relayproto.HelloBody{StaticIP: "not-an-ip"})
 	if st != relayproto.HelloBadStaticIP {
 		t.Fatalf("garbage static ip: status %d", st)
 	}
@@ -376,7 +406,7 @@ func TestSessionLimits(t *testing.T) {
 	t.Parallel()
 	r := startRelay(t, func(c *Config) { c.Limits.MaxSessionsPerSource = 1 })
 	openSession(t, r.addr)
-	_, st, _ := dialHello(t, r.addr, relayproto.HelloBody{Auth: "pw", StaticIP: "127.0.0.1"})
+	_, st, _ := dialHello(t, r.addr, "pw", relayproto.HelloBody{StaticIP: "127.0.0.1"})
 	if st != relayproto.HelloSessionLimit {
 		t.Fatalf("second session from the same source: %d", st)
 	}

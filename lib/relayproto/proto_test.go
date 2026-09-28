@@ -12,7 +12,7 @@ import (
 // package; a change here must be mirrored there (and is a protocol bump).
 const (
 	fixtureHello       = "42524c5901003f7b2261757468223a22736563726574222c22766d5f6964223a223031414258222c227374617469635f6970223a223230352e3233342e3230302e323437227d"
-	fixtureHelloReply  = "00001f7b226567726573735f6970223a223230352e3233342e3230302e323437227d"
+	fixtureHelloReply  = "0000567b226567726573735f6970223a223230352e3233342e3230302e323437222c2270726f6f66223a2249586e72694d744e584c4f7267344f41794d6b4e446b55746977635043424b66694e674e6e522f69617a343d227d"
 	fixtureHelloRefuse = "01001a7b226572726f72223a226261642063726564656e7469616c227d"
 	fixtureTCPHeader   = "06010101010050"
 	fixtureUDPHeader   = "1101000001007b"
@@ -49,7 +49,7 @@ func TestHelloFixture(t *testing.T) {
 }
 
 func TestHelloReplyFixtures(t *testing.T) {
-	ok, err := EncodeHelloReply(HelloOK, HelloReplyBody{EgressIP: "205.234.200.247"})
+	ok, err := EncodeHelloReply(HelloOK, HelloReplyBody{EgressIP: "205.234.200.247", Proof: fixtureServerProof})
 	if err != nil {
 		t.Fatal(err)
 	}

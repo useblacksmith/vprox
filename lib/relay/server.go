@@ -7,7 +7,6 @@ package relay
 
 import (
 	"context"
-	"crypto/subtle"
 	"crypto/tls"
 	"errors"
 	"io"
@@ -62,7 +61,8 @@ func DefaultLimits() Limits {
 // Config configures a Server.
 type Config struct {
 	TLS *tls.Config
-	// Password is the bearer credential expected in the hello.
+	// Password is the shared secret (VPROX_PASSWORD) both ends prove over
+	// the TLS channel in the hello; it is never sent on the wire.
 	Password string
 	// AllowSources restricts which peers may connect; empty allows none.
 	AllowSources []netip.Prefix
@@ -288,7 +288,12 @@ func (s *Server) handleConn(raw net.Conn, src netip.Addr) {
 		s.refuseHello(tc, src, relayproto.HelloProtocolError, "malformed hello")
 		return
 	}
-	if subtle.ConstantTimeCompare([]byte(hello.Auth), []byte(s.cfg.Password)) != 1 {
+	binding, err := relayproto.ChannelBinding(tc.ConnectionState())
+	if err != nil {
+		s.refuseHello(tc, src, relayproto.HelloProtocolError, "channel binding unavailable")
+		return
+	}
+	if !relayproto.VerifyProof(hello.Auth, relayproto.ClientProof(s.cfg.Password, binding)) {
 		s.refuseHello(tc, src, relayproto.HelloUnauthorized, "bad credential")
 		return
 	}
@@ -310,7 +315,10 @@ func (s *Server) handleConn(raw net.Conn, src netip.Addr) {
 	}
 	defer s.releaseSession(sess)
 
-	if err := relayproto.WriteHelloReply(tc, relayproto.HelloOK, relayproto.HelloReplyBody{EgressIP: staticIP.String()}); err != nil {
+	if err := relayproto.WriteHelloReply(tc, relayproto.HelloOK, relayproto.HelloReplyBody{
+		EgressIP: staticIP.String(),
+		Proof:    relayproto.ServerProof(s.cfg.Password, binding),
+	}); err != nil {
 		return
 	}
 	_ = tc.SetDeadline(time.Time{})

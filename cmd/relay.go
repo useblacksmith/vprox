@@ -2,10 +2,7 @@ package cmd
 
 import (
 	"context"
-	"crypto/sha256"
 	"crypto/tls"
-	"crypto/x509"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"log"
@@ -43,7 +40,6 @@ var relayCmdArgs struct {
 	tlsCert       string
 	tlsKey        string
 	metricsAddr   string
-	printPin      bool
 	maxSessions   int
 	maxPerSource  int
 	maxStreams    int
@@ -71,8 +67,6 @@ func init() {
 	f.StringVar(&relayCmdArgs.tlsKey, "tls-key", "", "TLS key PEM (default: embedded)")
 	f.StringVar(&relayCmdArgs.metricsAddr, "metrics-addr", "127.0.0.1:9444",
 		"address for the Prometheus /metrics endpoint (empty disables)")
-	f.BoolVar(&relayCmdArgs.printPin, "print-spki-pin", false,
-		"print the base64 SHA-256 SPKI pin of the TLS certificate and exit")
 	f.IntVar(&relayCmdArgs.maxSessions, "max-sessions", def.MaxSessions, "max concurrent sessions")
 	f.IntVar(&relayCmdArgs.maxPerSource, "max-sessions-per-source", def.MaxSessionsPerSource,
 		"max concurrent sessions per source IP")
@@ -105,15 +99,6 @@ func runRelay(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	pin, err := spkiPin(cert)
-	if err != nil {
-		return err
-	}
-	if relayCmdArgs.printPin {
-		fmt.Println(pin)
-		return nil
-	}
-
 	if len(relayCmdArgs.allowSources) == 0 {
 		return errors.New("missing required flag: --allow-source")
 	}
@@ -185,7 +170,6 @@ func runRelay(cmd *cobra.Command, args []string) error {
 		}()
 	}
 
-	log.Printf("relay: spki pin %s", pin)
 	log.Printf("relay: allow sources %v; deny %s", allow, policy)
 
 	errCh := make(chan error, len(relayCmdArgs.listen))
@@ -205,20 +189,6 @@ func runRelay(cmd *cobra.Command, args []string) error {
 		}
 	}
 	return nil
-}
-
-// spkiPin is the base64 SHA-256 of the leaf certificate's
-// SubjectPublicKeyInfo, the value the host egress proxy pins.
-func spkiPin(cert tls.Certificate) (string, error) {
-	if len(cert.Certificate) == 0 {
-		return "", errors.New("certificate chain is empty")
-	}
-	leaf, err := x509.ParseCertificate(cert.Certificate[0])
-	if err != nil {
-		return "", fmt.Errorf("parse certificate: %v", err)
-	}
-	sum := sha256.Sum256(leaf.RawSubjectPublicKeyInfo)
-	return base64.StdEncoding.EncodeToString(sum[:]), nil
 }
 
 func parsePrefixes(strs []string) ([]netip.Prefix, error) {
