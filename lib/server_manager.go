@@ -157,6 +157,11 @@ func (sm *ServerManager) Start(ip netip.Addr) error {
 			log.Printf("[%v] failed to start iptables: %v", ip, err)
 			return
 		}
+		if err := srv.removeLegacyIpip(); err != nil {
+			srv.markReadinessFatal(ReadinessReasonServerSetupFailed)
+			log.Printf("[%v] failed to remove legacy ipip tunnels: %v", ip, err)
+			return
+		}
 		if err := srv.ListenForHttps(); err != nil {
 			if subctx.Err() != nil {
 				return
