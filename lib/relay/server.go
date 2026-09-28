@@ -300,6 +300,7 @@ func (s *Server) handleConn(raw net.Conn, src netip.Addr) {
 
 	sess := &session{
 		srv:      s,
+		conn:     tc,
 		src:      src,
 		vmID:     hello.VMID,
 		staticIP: staticIP,
@@ -380,6 +381,7 @@ func (s *Server) Sessions() int {
 // session is one authenticated per-VM yamux session.
 type session struct {
 	srv      *Server
+	conn     net.Conn
 	src      netip.Addr
 	vmID     string
 	staticIP netip.Addr
@@ -420,13 +422,10 @@ func (sess *session) goAway() {
 	}
 }
 
+// close cuts the session whether or not its mux exists yet: closing the
+// transport fails a pending hello reply or yamux setup and ends serve.
 func (sess *session) close() {
-	sess.muxMu.Lock()
-	mux := sess.mux
-	sess.muxMu.Unlock()
-	if mux != nil {
-		_ = mux.Close()
-	}
+	_ = sess.conn.Close()
 }
 
 func (sess *session) serve() {
