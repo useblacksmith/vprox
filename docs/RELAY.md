@@ -1,15 +1,18 @@
 # Egress relay (`vprox relay`)
 
-The relay is the vprox side of the macOS static-IP userspace dataplane. A
-macOS host runs a root `egress-proxy` daemon that receives VM traffic via pf
-`rdr`, opens **one TLS 1.3 connection per VM** to the relay, and multiplexes
-that VM's TCP and UDP flows over it with yamux. The relay dials every
+The relay is the vprox side of the macOS static-IP dataplane. On a macOS
+host, pf `rdr` steers each static-IP VM's off-subnet TCP and UDP to a proxy
+that runs inside the Blacksmith agent (`agent/egressproxy` in
+FastActions/fa); a small root `pf-helper` child per VM performs the two
+privileged pf ioctls and opens the relay connection on the agent's behalf.
+The proxy holds **one TLS 1.3 connection per VM** to the relay and
+multiplexes that VM's flows over it with yamux. The relay dials every
 destination from the static IP the session was granted, so the VM's egress
 address is the static IP without any tunnel or `route-to`.
 
 ```
-VM -> pf rdr -> egress-proxy (mac, root) -> TLS1.3/yamux -> vprox relay -> dst
-                                                            bind(static_ip)
+VM -> pf rdr -> egressproxy (inside the mac agent; root pf-helper for NATLOOK/state kill/dial)
+   -> TLS 1.3 + yamux, one session per VM -> vprox relay -> bind(static_ip) -> destination
 ```
 
 ## Running
