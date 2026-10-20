@@ -2,6 +2,7 @@ package lib
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"embed"
 	"encoding/json"
@@ -70,8 +71,12 @@ type Server struct {
 	// InternalNetworkCidr is the CIDR block of the internal network.
 	InternalNetworkCidr string
 
-	// Password is needed to authenticate connection requests.
+	// Password is a single password accepted in addition to Passwords.
 	Password string
+
+	// Passwords are the passwords accepted for connection requests.
+	// Empty passwords are never accepted.
+	Passwords []string
 
 	// Index is a unique server index for firewall marks and other uses. It starts at 0.
 	Index uint16
@@ -166,7 +171,16 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	auth := r.Header.Get("Authorization")
-	if auth != "Bearer "+srv.Password {
+	authorized := 0
+	if srv.Password != "" {
+		authorized |= subtle.ConstantTimeCompare([]byte(auth), []byte("Bearer "+srv.Password))
+	}
+	for _, password := range srv.Passwords {
+		if password != "" {
+			authorized |= subtle.ConstantTimeCompare([]byte(auth), []byte("Bearer "+password))
+		}
+	}
+	if authorized != 1 {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}

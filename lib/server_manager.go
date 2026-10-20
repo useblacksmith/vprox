@@ -25,7 +25,7 @@ type ServerManager struct {
 	wgClient            *wgctrl.Client
 	ipt                 *iptables.IPTables
 	key                 wgtypes.Key
-	password            string
+	passwords           []string
 	ctx                 context.Context
 	waitGroup           *sync.WaitGroup
 	wgBlock             netip.Prefix
@@ -39,8 +39,9 @@ type ServerManager struct {
 	nextFreeIndex uint16   // next free index not in the stack
 }
 
-// NewServerManager creates a new server manager
-func NewServerManager(wgBlock netip.Prefix, wgBlockPerIp uint, ctx context.Context, key wgtypes.Key, password string, region string, internalNetworkCidr string) (*ServerManager, error) {
+// NewServerManager creates a new server manager accepting password and any
+// additionalPasswords for every managed server.
+func NewServerManager(wgBlock netip.Prefix, wgBlockPerIp uint, ctx context.Context, key wgtypes.Key, password string, region string, internalNetworkCidr string, additionalPasswords ...string) (*ServerManager, error) {
 	// Make a shared WireGuard client.
 	wgClient, err := wgctrl.New()
 	if err != nil {
@@ -61,7 +62,7 @@ func NewServerManager(wgBlock netip.Prefix, wgBlockPerIp uint, ctx context.Conte
 	sm.wgClient = wgClient
 	sm.ipt = ipt
 	sm.key = key
-	sm.password = password
+	sm.passwords = append([]string{password}, additionalPasswords...)
 	sm.ctx = ctx
 	sm.waitGroup = new(sync.WaitGroup)
 	sm.wgBlock = wgBlock.Masked()
@@ -111,7 +112,7 @@ func (sm *ServerManager) Start(ip netip.Addr) error {
 	srv := &Server{
 		Key:                 sm.key,
 		BindAddr:            ip,
-		Password:            sm.password,
+		Passwords:           sm.passwords,
 		Index:               i,
 		Ipt:                 sm.ipt,
 		WgClient:            sm.wgClient,

@@ -42,6 +42,29 @@ Note that Machine B must be able to send UDP packets to port 50227 on Machine A,
 
 All outbound network traffic seen by `vprox0` will automatically be forwarded through the WireGuard tunnel. The VPN server masquerades the source IP address.
 
+### Multiple passwords
+
+Both `vprox server` and `vprox relay` accept a comma-separated `VPROX_PASSWORDS`
+list, so clients can use different passwords or migrate during a password rotation:
+
+```bash
+VPROX_PASSWORDS='old-password,new-password' vprox server \
+  --ip 172.31.64.125 --wg-block 240.1.0.0/16 --region us-west
+
+# Each client still uses one accepted password.
+VPROX_PASSWORD=new-password vprox connect 1.2.3.4 --interface vprox0
+```
+
+`VPROX_PASSWORD` continues to work as a literal single password, including any
+commas or whitespace. If both variables are set on a server, it accepts the
+passwords from both. In `VPROX_PASSWORDS`, surrounding whitespace is trimmed
+from each entry and empty entries are rejected. Passwords containing commas
+or leading/trailing whitespace should use `VPROX_PASSWORD`.
+
+Restart the server or relay after changing its passwords. To retire a password,
+remove it from both variables. Existing WireGuard tunnels remain active;
+relay restarts drain connections as described in the [relay documentation](docs/RELAY.md).
+
 ### Building
 
 To build `vprox`, run the following command with Go 1.22+ installed:

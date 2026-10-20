@@ -217,6 +217,81 @@ func udpEcho(t *testing.T) netip.AddrPort {
 	return netip.MustParseAddrPort(uc.LocalAddr().String())
 }
 
+func TestHelloMultiplePasswords(t *testing.T) {
+	t.Parallel()
+	for _, legacy := range []string{"", "legacy"} {
+		name := "list only"
+		if legacy != "" {
+			name = "list and legacy"
+		}
+		t.Run(name, func(t *testing.T) {
+			r := startRelay(t, func(c *Config) {
+				c.Password = legacy
+				c.Passwords = []string{"first", "second", "third"}
+			})
+			passwords := []string{"first", "second", "third"}
+			if legacy != "" {
+				passwords = append(passwords, legacy)
+			}
+			for _, password := range passwords {
+				// dialHello also verifies that the server proves knowledge of
+				// this password, including when it is not first in the list.
+				tc, status, reply := dialHello(t, r.addr, password, relayproto.HelloBody{StaticIP: "127.0.0.1"})
+				_ = tc.Close()
+				if status != relayproto.HelloOK || reply.EgressIP != "127.0.0.1" {
+					t.Fatalf("accepted password %q: status %d, reply %+v", password, status, reply)
+				}
+			}
+			for _, password := range []string{"", "wrong", "first,second,third"} {
+				tc, status, _ := dialHello(t, r.addr, password, relayproto.HelloBody{StaticIP: "127.0.0.1"})
+				_ = tc.Close()
+				if status != relayproto.HelloUnauthorized {
+					t.Fatalf("invalid password %q: status %d", password, status)
+				}
+			}
+
+			tc, binding := dialTLS(t, r.addr)
+			_ = tc.Close()
+			tc, status, _ := dialHello(t, r.addr, "second", relayproto.HelloBody{
+				Auth:     relayproto.ClientProof("second", binding),
+				StaticIP: "127.0.0.1",
+			})
+			_ = tc.Close()
+			if status != relayproto.HelloUnauthorized {
+				t.Fatalf("replayed proof: status %d", status)
+			}
+		})
+	}
+}
+
+func TestNewServerPasswords(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name      string
+		password  string
+		passwords []string
+		wantErr   string
+	}{
+		{name: "missing", wantErr: "relay: password required"},
+		{name: "empty list", passwords: []string{}, wantErr: "relay: password required"},
+		{name: "empty password", passwords: []string{""}, wantErr: "relay: empty password"},
+		{name: "empty with valid", passwords: []string{"valid", ""}, wantErr: "relay: empty password"},
+		{name: "empty with legacy", password: "legacy", passwords: []string{""}, wantErr: "relay: empty password"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewServer(Config{
+				TLS:       testTLS(t),
+				Password:  tt.password,
+				Passwords: tt.passwords,
+				Metrics:   NewMetrics(prometheus.NewRegistry()),
+			})
+			if err == nil || err.Error() != tt.wantErr {
+				t.Fatalf("NewServer error = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestHelloRefusals(t *testing.T) {
 	t.Parallel()
 	r := startRelay(t, nil)
