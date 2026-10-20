@@ -303,12 +303,13 @@ func (s *Server) handleConn(raw net.Conn, src netip.Addr) {
 		s.refuseHello(tc, src, relayproto.HelloProtocolError, "channel binding unavailable")
 		return
 	}
-	// Check every password, then use the matching one for the server proof.
+	// Find a matching password and use it for the server proof.
 	// This keeps clients that know only one accepted password compatible.
 	var password string
 	for _, candidate := range s.cfg.Passwords {
 		if relayproto.VerifyProof(hello.Auth, relayproto.ClientProof(candidate, binding)) {
 			password = candidate
+			break
 		}
 	}
 	if password == "" {

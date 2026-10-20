@@ -2,7 +2,6 @@ package lib
 
 import (
 	"context"
-	"crypto/subtle"
 	"crypto/tls"
 	"embed"
 	"encoding/json"
@@ -171,16 +170,14 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	auth := r.Header.Get("Authorization")
-	authorized := 0
-	if srv.Password != "" {
-		authorized |= subtle.ConstantTimeCompare([]byte(auth), []byte("Bearer "+srv.Password))
-	}
+	authorized := srv.Password != "" && auth == "Bearer "+srv.Password
 	for _, password := range srv.Passwords {
-		if password != "" {
-			authorized |= subtle.ConstantTimeCompare([]byte(auth), []byte("Bearer "+password))
+		if password != "" && auth == "Bearer "+password {
+			authorized = true
+			break
 		}
 	}
-	if authorized != 1 {
+	if !authorized {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
