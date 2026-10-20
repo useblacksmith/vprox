@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/vishvananda/netlink"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
@@ -23,6 +25,7 @@ func TestConnectHandlerPasswords(t *testing.T) {
 		{name: "legacy", password: "old", accepted: []string{"old"}},
 		{name: "multiple", passwords: []string{"first", "second"}, accepted: []string{"first", "second"}},
 		{name: "both", password: "old", passwords: []string{"first", "second"}, accepted: []string{"old", "first", "second"}},
+		{name: "duplicates", password: "first", passwords: []string{"first", "first", "second"}, accepted: []string{"first", "second"}},
 		{name: "literal legacy", password: " old,password ", accepted: []string{" old,password "}},
 		{name: "empty list entry", passwords: []string{"", "first"}, accepted: []string{"first"}},
 		{name: "unconfigured"},
@@ -30,7 +33,13 @@ func TestConnectHandlerPasswords(t *testing.T) {
 	}
 	for _, cfg := range configs {
 		t.Run(cfg.name, func(t *testing.T) {
-			srv := &Server{Password: cfg.password, Passwords: cfg.passwords}
+			srv := &Server{
+				Password:  cfg.password,
+				Passwords: cfg.passwords,
+				BindIface: &netlink.Dummy{},
+				WgCidr:    netip.MustParsePrefix("10.1.0.1/24"),
+			}
+			require.NoError(t, srv.InitState())
 			headers := map[string]int{
 				"":                    http.StatusUnauthorized,
 				"Bearer ":             http.StatusUnauthorized,

@@ -97,6 +97,9 @@ type Server struct {
 
 	ipAllocator *IpAllocator
 
+	// authTokens is built by InitState and read-only while serving requests.
+	authTokens map[string]struct{}
+
 	mu sync.Mutex // Protects newPeers and peerIPs.
 	// newPeers records the time of each peer's most recent /connect, granting
 	// a grace period during which the idle reaper won't remove the peer. This
@@ -141,6 +144,15 @@ func (srv *Server) InitState() error {
 
 	srv.newPeers = make(map[wgtypes.Key]time.Time)
 	srv.peerIPs = make(map[wgtypes.Key]netip.Addr)
+	srv.authTokens = make(map[string]struct{}, len(srv.Passwords)+1)
+	if srv.Password != "" {
+		srv.authTokens["Bearer "+srv.Password] = struct{}{}
+	}
+	for _, password := range srv.Passwords {
+		if password != "" {
+			srv.authTokens["Bearer "+password] = struct{}{}
+		}
+	}
 	srv.initReadiness()
 	return nil
 }
@@ -169,15 +181,7 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	auth := r.Header.Get("Authorization")
-	authorized := srv.Password != "" && auth == "Bearer "+srv.Password
-	for _, password := range srv.Passwords {
-		if password != "" && auth == "Bearer "+password {
-			authorized = true
-			break
-		}
-	}
-	if !authorized {
+	if _, ok := srv.authTokens[r.Header.Get("Authorization")]; !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
