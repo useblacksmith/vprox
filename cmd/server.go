@@ -22,7 +22,10 @@ const awsPollDuration = 5 * time.Second // AWS is polled this frequently for new
 var ServerCmd = &cobra.Command{
 	Use:   "server",
 	Short: "Start a VPN server, listening for new WireGuard peers",
-	RunE:  runServer,
+	Long: `Start a VPN server, listening for new WireGuard peers.
+Set VPROX_PASSWORD for a single password, or VPROX_PASSWORDS for a comma-separated
+list. If both are set, all passwords are accepted.`,
+	RunE: runServer,
 }
 
 var serverCmdArgs struct {
@@ -101,14 +104,14 @@ func runServer(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load server key: %v", err)
 	}
 
-	password, err := lib.GetVproxPassword()
+	passwords, err := lib.GetVproxPasswords()
 	if err != nil {
 		return err
 	}
 
 	ctx, done := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 
-	sm, err := lib.NewServerManager(wgBlock, wgBlockPerIp, ctx, key, password, serverCmdArgs.region, serverCmdArgs.internalNetworkCidr)
+	sm, err := lib.NewServerManager(wgBlock, wgBlockPerIp, ctx, key, passwords[0], serverCmdArgs.region, serverCmdArgs.internalNetworkCidr, passwords[1:]...)
 	if err != nil {
 		done()
 		return err

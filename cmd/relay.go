@@ -28,7 +28,9 @@ var RelayCmd = &cobra.Command{
 	Long: `Start the egress relay. A macOS host's egress proxy opens one TLS 1.3
 session per VM, authenticates with VPROX_PASSWORD, and multiplexes that VM's
 TCP and UDP flows over it. The relay dials each destination from the static
-IP the session was granted, after checking it against the destination policy.`,
+IP the session was granted, after checking it against the destination policy.
+Set VPROX_PASSWORD for a single password, or VPROX_PASSWORDS for a comma-separated
+list. If both are set, all passwords are accepted.`,
 	RunE: runRelay,
 }
 
@@ -110,7 +112,7 @@ func runRelay(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("--deny-cidr: %v", err)
 	}
-	password, err := lib.GetVproxPassword()
+	passwords, err := lib.GetVproxPasswords()
 	if err != nil {
 		return err
 	}
@@ -130,7 +132,7 @@ func runRelay(cmd *cobra.Command, args []string) error {
 	})
 	srv, err := relay.NewServer(relay.Config{
 		TLS:          &tls.Config{Certificates: []tls.Certificate{cert}},
-		Password:     password,
+		Passwords:    passwords,
 		AllowSources: allow,
 		Policy:       policy,
 		Metrics:      relay.NewMetrics(reg),

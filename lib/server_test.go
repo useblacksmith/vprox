@@ -2,12 +2,72 @@ package lib
 
 import (
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/vishvananda/netlink"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
+
+func TestConnectHandlerPasswords(t *testing.T) {
+	t.Parallel()
+	configs := []struct {
+		name      string
+		password  string
+		passwords []string
+		accepted  []string
+	}{
+		{name: "legacy", password: "old", accepted: []string{"old"}},
+		{name: "multiple", passwords: []string{"first", "second"}, accepted: []string{"first", "second"}},
+		{name: "both", password: "old", passwords: []string{"first", "second"}, accepted: []string{"old", "first", "second"}},
+		{name: "duplicates", password: "first", passwords: []string{"first", "first", "second"}, accepted: []string{"first", "second"}},
+		{name: "literal legacy", password: " old,password ", accepted: []string{" old,password "}},
+		{name: "empty list entry", passwords: []string{"", "first"}, accepted: []string{"first"}},
+		{name: "unconfigured"},
+		{name: "empty passwords", passwords: []string{"", ""}},
+	}
+	for _, cfg := range configs {
+		t.Run(cfg.name, func(t *testing.T) {
+			srv := &Server{
+				Password:  cfg.password,
+				Passwords: cfg.passwords,
+				BindIface: &netlink.Dummy{},
+				WgCidr:    netip.MustParsePrefix("10.1.0.1/24"),
+			}
+			require.NoError(t, srv.InitState())
+			headers := map[string]int{
+				"":                    http.StatusUnauthorized,
+				"Bearer ":             http.StatusUnauthorized,
+				"Bearer wrong":        http.StatusUnauthorized,
+				"Bearer first,second": http.StatusUnauthorized,
+				"Bearer firs":         http.StatusUnauthorized,
+				"Bearer first-extra":  http.StatusUnauthorized,
+				"Basic first":         http.StatusUnauthorized,
+			}
+			for _, password := range cfg.accepted {
+				headers["Bearer "+password] = http.StatusBadRequest
+				headers[password] = http.StatusUnauthorized
+			}
+			for header, wantStatus := range headers {
+				// An authenticated request reaches JSON parsing. Invalid JSON
+				// avoids touching WireGuard or requiring a privileged test.
+				req := httptest.NewRequest(http.MethodPost, "/connect", strings.NewReader("{"))
+				req.Header.Set("Authorization", header)
+				rec := httptest.NewRecorder()
+				srv.connectHandler(rec, req)
+				assert.Equal(t, wantStatus, rec.Code, "header %q", header)
+				if wantStatus == http.StatusBadRequest {
+					assert.Equal(t, "failed to parse request body\n", rec.Body.String())
+				}
+			}
+		})
+	}
+}
 
 func mustKey(t *testing.T) wgtypes.Key {
 	t.Helper()

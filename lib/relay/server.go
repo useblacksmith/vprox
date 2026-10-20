@@ -60,9 +60,12 @@ func DefaultLimits() Limits {
 // Config configures a Server.
 type Config struct {
 	TLS *tls.Config
-	// Password is the shared secret (VPROX_PASSWORD) both ends prove over
-	// the TLS channel in the hello; it is never sent on the wire.
+	// Password is a single shared secret accepted in addition to Passwords.
 	Password string
+	// Passwords are the shared secrets accepted in the hello. Both ends prove
+	// the matching password over the TLS channel; it is never sent on the wire.
+	// Empty passwords are invalid.
+	Passwords []string
 	// AllowSources restricts which peers may connect; empty allows none.
 	AllowSources []netip.Prefix
 	Policy       *Policy
@@ -93,9 +96,21 @@ func NewServer(cfg Config) (*Server, error) {
 	if cfg.TLS == nil {
 		return nil, errors.New("relay: TLS config required")
 	}
-	if cfg.Password == "" {
+	// Copy the list so callers cannot change the accepted passwords after
+	// construction by modifying their config slice.
+	passwords := append([]string(nil), cfg.Passwords...)
+	if cfg.Password != "" {
+		passwords = append(passwords, cfg.Password)
+	}
+	if len(passwords) == 0 {
 		return nil, errors.New("relay: password required")
 	}
+	for _, password := range passwords {
+		if password == "" {
+			return nil, errors.New("relay: empty password")
+		}
+	}
+	cfg.Passwords = passwords
 	if cfg.Policy == nil {
 		cfg.Policy = NewPolicy(PolicyConfig{})
 	}
@@ -288,7 +303,16 @@ func (s *Server) handleConn(raw net.Conn, src netip.Addr) {
 		s.refuseHello(tc, src, relayproto.HelloProtocolError, "channel binding unavailable")
 		return
 	}
-	if !relayproto.VerifyProof(hello.Auth, relayproto.ClientProof(s.cfg.Password, binding)) {
+	// Find a matching password and use it for the server proof.
+	// This keeps clients that know only one accepted password compatible.
+	var password string
+	for _, candidate := range s.cfg.Passwords {
+		if relayproto.VerifyProof(hello.Auth, relayproto.ClientProof(candidate, binding)) {
+			password = candidate
+			break
+		}
+	}
+	if password == "" {
 		s.refuseHello(tc, src, relayproto.HelloUnauthorized, "bad credential")
 		return
 	}
@@ -313,7 +337,7 @@ func (s *Server) handleConn(raw net.Conn, src netip.Addr) {
 
 	if err := relayproto.WriteHelloReply(tc, relayproto.HelloOK, relayproto.HelloReplyBody{
 		EgressIP: staticIP.String(),
-		Proof:    relayproto.ServerProof(s.cfg.Password, binding),
+		Proof:    relayproto.ServerProof(password, binding),
 	}); err != nil {
 		return
 	}

@@ -70,8 +70,12 @@ type Server struct {
 	// InternalNetworkCidr is the CIDR block of the internal network.
 	InternalNetworkCidr string
 
-	// Password is needed to authenticate connection requests.
+	// Password is a single password accepted in addition to Passwords.
 	Password string
+
+	// Passwords are the passwords accepted for connection requests.
+	// Empty passwords are never accepted.
+	Passwords []string
 
 	// Index is a unique server index for firewall marks and other uses. It starts at 0.
 	Index uint16
@@ -92,6 +96,9 @@ type Server struct {
 	Region string
 
 	ipAllocator *IpAllocator
+
+	// authTokens is built by InitState and read-only while serving requests.
+	authTokens map[string]struct{}
 
 	mu sync.Mutex // Protects newPeers and peerIPs.
 	// newPeers records the time of each peer's most recent /connect, granting
@@ -137,6 +144,15 @@ func (srv *Server) InitState() error {
 
 	srv.newPeers = make(map[wgtypes.Key]time.Time)
 	srv.peerIPs = make(map[wgtypes.Key]netip.Addr)
+	srv.authTokens = make(map[string]struct{}, len(srv.Passwords)+1)
+	if srv.Password != "" {
+		srv.authTokens["Bearer "+srv.Password] = struct{}{}
+	}
+	for _, password := range srv.Passwords {
+		if password != "" {
+			srv.authTokens["Bearer "+password] = struct{}{}
+		}
+	}
 	srv.initReadiness()
 	return nil
 }
@@ -165,8 +181,7 @@ func (srv *Server) connectHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	auth := r.Header.Get("Authorization")
-	if auth != "Bearer "+srv.Password {
+	if _, ok := srv.authTokens[r.Header.Get("Authorization")]; !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}

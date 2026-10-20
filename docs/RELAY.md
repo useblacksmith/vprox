@@ -22,6 +22,13 @@ VPROX_PASSWORD=... vprox relay \
   --metrics-addr 127.0.0.1:9444
 ```
 
+To accept multiple passwords, use `VPROX_PASSWORDS='old-password,new-password'`.
+If `VPROX_PASSWORD` is also set, that password is accepted too. Each host proxy
+continues to use one password; the relay replies with a proof of the password
+that authenticated that connection. The wire protocol is unchanged.
+See [multiple passwords](../README.md#multiple-passwords) for parsing and
+rotation details.
+
 * `--allow-source` is required; connections from other sources are dropped
   before the TLS handshake. Use the same CIDRs as the `/connect-ipip` UFW rule.
 * The TLS certificate defaults to the embedded vprox certificate. The host
