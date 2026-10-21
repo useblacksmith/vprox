@@ -5,12 +5,9 @@ This runbook covers `vprox server` (HTTPS/WireGuard control plane) and
 enabled. They are separate processes and restarting one does not reload the
 other's credentials.
 
-Blacksmith operators should also follow the private
-[fa coordination runbook](https://github.com/FastActions/fa/blob/main/runbooks/CREDENTIAL_ROTATION.md)
-for the operation journal, fleet/inventory reconciliation, Doppler runner
-configs, graceful agent roll, and old-job drain. This public document contains
-the protocol and per-gateway procedure without private fleet addresses or
-customer assignment data.
+Complete staging before repeating for production. Runner hosts must be rolled
+to load the new client password; keep both passwords accepted until outgoing
+agents and their jobs have finished.
 
 ## Password semantics and the four phases
 
@@ -103,9 +100,22 @@ Build/download first and keep the service interruption short.
 
 ## 2. Prepare the new password in the actual server secret source
 
-Generate an independent high-entropy password and preserve old. In the shared
-journal these are `$ROTATION_DIR/vprox.new` and `$ROTATION_DIR/vprox.old`. Compare
-old with all participating client and server sources without printing values.
+Run the examples in Bash. Create a private working directory, and reuse it for
+retries so the replacement key stays the same:
+
+```bash
+set +x
+umask 077
+ROTATION_DIR=$(mktemp -d "${TMPDIR:-/tmp}/credential-rotation.XXXXXX")
+export ROTATION_DIR
+```
+
+Generate an independent cryptographically random new password. Save it as
+`$ROTATION_DIR/vprox.new` and preserve the current password as `$ROTATION_DIR/vprox.old`.
+Compare old with all participating client and server sources without printing values.
+
+Save only the raw credential values in `vprox.old` and `vprox.new` inside
+that directory, with mode `0600`. Keep these files out of Git and terminal logs.
 
 In Blacksmith the server units use Doppler project `vprox-server`. Determine
 the config referenced by the **deployed unit's service token**; do not assume
@@ -358,16 +368,17 @@ Each ledger row needs new/old/invalid control results and, where applicable,
 relay results plus executable hash and secret-source identity.
 
 Only then change every participating runner `VPROX_PASSWORD` to the **single**
-new password. In Blacksmith, enumerate all applicable `gha-agent` configs via
-the fa procedure; include Linux ARM and both Mac regions. Read back each write
-without printing secrets. Do not create missing variables without reviewing
-why they were absent.
+new password in all applicable Doppler `gha-agent` configs for the selected
+environment. Include regional configs, Linux ARM, and both Mac regions. Read
+back each write without printing secrets. Do not create missing variables
+without reviewing why they were absent.
 
 It is valid to stop here if the requested scope is server overlap and Doppler
 only. Keep old accepted until the later client roll/drain. When authorized,
-gracefully roll runner agents and inspect actual process credentials, old jobs,
-and host egress-proxy consumers. An existing WireGuard tunnel or relay session
-can keep working while its next reconnect would still use the old password.
+gracefully roll all live/reporting runner hosts. Inspect actual process
+credentials, old jobs, and host egress-proxy consumers. An existing WireGuard
+tunnel or relay session can keep working while its next reconnect would still
+use the old password.
 Do not treat today's successful egress as proof that old is unused.
 
 ## 6. Retire old, including both variables and both processes
