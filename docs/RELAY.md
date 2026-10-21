@@ -28,6 +28,8 @@ continues to use one password; the relay replies with a proof of the password
 that authenticated that connection. The wire protocol is unchanged.
 See [multiple passwords](../README.md#multiple-passwords) for parsing and
 rotation details.
+For an operator procedure, including session drain and verification of the
+server's channel-bound proof, use the [rotation runbook](CREDENTIAL_ROTATION.md).
 
 * `--allow-source` is required; connections from other sources are dropped
   before the TLS handshake. Use the same CIDRs as the `/connect-ipip` UFW rule.

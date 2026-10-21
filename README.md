@@ -44,6 +44,10 @@ All outbound network traffic seen by `vprox0` will automatically be forwarded th
 
 ### Multiple passwords
 
+The [credential rotation runbook](docs/CREDENTIAL_ROTATION.md) covers server and
+relay coverage, secret sources, safe restarts, both authentication probes,
+client drain, retirement, and recovery.
+
 Both `vprox server` and `vprox relay` accept a comma-separated `VPROX_PASSWORDS`
 list, so clients can use different passwords or migrate during a password rotation:
 
